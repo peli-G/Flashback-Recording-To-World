@@ -1,0 +1,11 @@
+{
+  "required": true,
+  "package": "com.moulberry.fbrtoworld.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "ClientboundLevelChunkPacketDataAccessor"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
