@@ -403,6 +403,28 @@ public class FbrWorldConverter {
         var biomeRegistry = registryAccess.lookupOrThrow(Registries.BIOME);
         Holder<Biome> defaultBiome = biomeRegistry.getOrThrow(Biomes.PLAINS);
 
+        // ── Extract light data from the packet ───────────────────────────────
+        // Light sections cover (minSectionY-1) to (minSectionY+sectionCount), i.e. 26 entries
+        // for the overworld. Section si corresponds to light index si+1.
+        var lightData = packet.getLightData();
+        java.util.BitSet skyMask   = lightData.getSkyYMask();
+        java.util.BitSet blockMask = lightData.getBlockYMask();
+        java.util.BitSet emptySky   = lightData.getEmptySkyYMask();
+        java.util.BitSet emptyBlock = lightData.getEmptyBlockYMask();
+        java.util.List<byte[]> skyArrays   = lightData.getSkyUpdates();
+        java.util.List<byte[]> blockArrays = lightData.getBlockUpdates();
+
+        // Build index-to-array maps from the packed bit arrays
+        // (only set bits in skyMask/blockMask have an array entry)
+        java.util.Map<Integer, byte[]> skyBySection   = new java.util.HashMap<>();
+        java.util.Map<Integer, byte[]> blockBySection = new java.util.HashMap<>();
+        int skyIdx = 0, blockIdx = 0;
+        int totalLightSections = sectionCount + 2; // one below, one above
+        for (int li = 0; li < totalLightSections; li++) {
+            if (skyMask.get(li)   && skyIdx   < skyArrays.size())   skyBySection.put(li,   skyArrays.get(skyIdx++));
+            if (blockMask.get(li) && blockIdx < blockArrays.size()) blockBySection.put(li, blockArrays.get(blockIdx++));
+        }
+
         for (int si = 0; si < sectionCount && rfbb.isReadable(); si++) {
             int sectionY = si + minSectionY;
             CompoundTag sec = new CompoundTag();
@@ -427,6 +449,15 @@ public class FbrWorldConverter {
                     .ifPresent(tag -> sec.put("block_states", tag));
             biomeCodec.encodeStart(ops, biomes).result()
                     .ifPresent(tag -> sec.put("biomes", tag));
+
+            // Write light arrays — light index is si+1 (offset by one extra section below)
+            int li = si + 1;
+            byte[] skyArr   = skyBySection.get(li);
+            byte[] blockArr = blockBySection.get(li);
+            if (skyArr != null)   sec.putByteArray("SkyLight",   skyArr);
+            else if (!emptySky.get(li))   sec.putByteArray("SkyLight",   new byte[2048]); // all dark
+            if (blockArr != null) sec.putByteArray("BlockLight", blockArr);
+            else if (!emptyBlock.get(li)) sec.putByteArray("BlockLight", new byte[2048]); // all dark
 
             sections.add(sec);
         }
