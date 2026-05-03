@@ -32,8 +32,8 @@ import java.util.zip.DeflaterOutputStream;
 
 public class FbrWorldConverter {
 
-    private static final int DATA_VERSION = 4189; // 1.21.11 — verify with F3 if needed
-    private static final String VERSION_NAME = "1.21.11";
+    private static final int DATA_VERSION = 4556; // 1.21.10
+    private static final String VERSION_NAME = "1.21.10";
 
     public static volatile boolean running = false;
 
