@@ -46,6 +46,7 @@ public class FbrWorldConverter {
                 convert(fbrPath, registryAccess, mc);
             } catch (Exception e) {
                 FbrToWorldMod.LOGGER.error("[FbrToWorld] Conversion failed", e);
+                clearActionBar(mc);
                 sendMessage(mc, "§c[FbrToWorld] Failed: " + e.getMessage() + " — see log.");
             } finally {
                 running = false;
@@ -90,7 +91,10 @@ public class FbrWorldConverter {
             // Flashback stores chunks in a flat indexed array across all dimensions.
             // Each index references a unique chunk packet regardless of dimension.
             List<ClientboundLevelChunkWithLightPacket> chunkPacketsByIndex = new ArrayList<>();
-            for (Path cacheFile : cacheFiles) {
+            int totalCacheFiles = cacheFiles.size();
+            for (int cfi = 0; cfi < totalCacheFiles; cfi++) {
+                Path cacheFile = cacheFiles.get(cfi);
+                setActionBar(mc, "Loading chunks", cfi + 1, totalCacheFiles);
                 try (InputStream is = Files.newInputStream(cacheFile)) {
                     while (true) {
                         byte[] sizeBytes = is.readNBytes(4);
@@ -131,7 +135,10 @@ public class FbrWorldConverter {
             flashbackFiles.sort(Comparator.comparing(p -> p.getFileName().toString()));
 
             final int MAGIC = 0xD780E884;
-            for (Path fbFile : flashbackFiles) {
+            int totalFbFiles = flashbackFiles.size();
+            for (int fbi = 0; fbi < totalFbFiles; fbi++) {
+                Path fbFile = flashbackFiles.get(fbi);
+                setActionBar(mc, "Scanning timeline", fbi + 1, totalFbFiles);
                 byte[] fbBytes = Files.readAllBytes(fbFile);
                 io.netty.buffer.ByteBuf raw = io.netty.buffer.Unpooled.wrappedBuffer(fbBytes);
                 net.minecraft.network.FriendlyByteBuf fbuf = new net.minecraft.network.FriendlyByteBuf(raw);
@@ -157,13 +164,54 @@ public class FbrWorldConverter {
                     if (name.equals("flashback:action/level_chunk_cached")) levelChunkCachedActionId = i;
                 }
 
-                // Snapshot size — we must scan it too, NOT skip it.
-                // The snapshot contains the initial Login packet (sets starting dimension)
-                // AND the first wave of level_chunk_cached entries.
+                // Read snapshot — must scan it for Login packet and initial chunk indices,
+                // but treat it as a separate bounded section to avoid byte misalignment.
                 int snapshotSize = fbuf.readInt();
-                int snapshotEnd = fbuf.readerIndex() + snapshotSize;
+                byte[] snapshotBytes = new byte[snapshotSize];
+                fbuf.readBytes(snapshotBytes);
+                net.minecraft.network.FriendlyByteBuf snapBuf = new net.minecraft.network.FriendlyByteBuf(
+                        io.netty.buffer.Unpooled.wrappedBuffer(snapshotBytes));
 
-                // Walk snapshot + main actions together in order
+                // Scan snapshot actions
+                while (snapBuf.readableBytes() > 0) {
+                    int actionId = snapBuf.readVarInt();
+                    int dataSize = snapBuf.readInt();
+                    byte[] actionData = new byte[dataSize];
+                    snapBuf.readBytes(actionData);
+
+                    if (actionId == gamePacketActionId) {
+                        var actionBuf = new RegistryFriendlyByteBuf(
+                                io.netty.buffer.Unpooled.wrappedBuffer(actionData), registryAccess);
+                        try {
+                            var pkt = gamePacketCodec.decode(actionBuf);
+                            String dimStr = null;
+                            if (pkt instanceof ClientboundLoginPacket lp) {
+                                dimStr = lp.commonPlayerSpawnInfo().dimension().toString();
+                            } else if (pkt instanceof ClientboundRespawnPacket rp) {
+                                dimStr = rp.commonPlayerSpawnInfo().dimension().toString();
+                            }
+                            if (dimStr != null) {
+                                int slash = dimStr.indexOf('/');
+                                currentDimension[0] = slash >= 0
+                                        ? dimStr.substring(slash + 2, dimStr.length() - 1).trim()
+                                        : "minecraft:overworld";
+                            }
+                        } catch (Exception ignored) {}
+                    } else if (actionId == levelChunkCachedActionId) {
+                        net.minecraft.network.FriendlyByteBuf indexBuf = new net.minecraft.network.FriendlyByteBuf(
+                                io.netty.buffer.Unpooled.wrappedBuffer(actionData));
+                        int chunkIndex = indexBuf.readVarInt();
+                        if (chunkIndex >= 0 && chunkIndex < chunkPacketsByIndex.size()) {
+                            ClientboundLevelChunkWithLightPacket cp = chunkPacketsByIndex.get(chunkIndex);
+                            if (cp != null) {
+                                dimChunkMap.computeIfAbsent(currentDimension[0], k -> new LinkedHashMap<>())
+                                        .put(ChunkPos.asLong(cp.getX(), cp.getZ()), cp);
+                            }
+                        }
+                    }
+                }
+
+                // Now scan main actions
                 while (fbuf.readableBytes() > 0) {
                     int actionId = fbuf.readVarInt();
                     int dataSize = fbuf.readInt();
@@ -275,10 +323,18 @@ public class FbrWorldConverter {
                 Map<Long, RegionFileWriter> regionWriters = new HashMap<>();
                 Map<Long, RegionFileWriter> entityWriters = new HashMap<>();
 
+                int dimTotal = chunkMap.size();
+                int dimWritten = 0;
                 for (ClientboundLevelChunkWithLightPacket packet : chunkMap.values()) {
                     ChunkPos pos = new ChunkPos(packet.getX(), packet.getZ());
                     long regionKey = ChunkPos.asLong(pos.getRegionX(), pos.getRegionZ());
                     String regionName = "r." + pos.getRegionX() + "." + pos.getRegionZ() + ".mca";
+
+                    // Update action bar every 16 chunks to avoid hammering the main thread
+                    if (dimWritten % 16 == 0) {
+                        String shortDim = dimId.contains(":") ? dimId.split(":")[1] : dimId;
+                        setActionBar(mc, "Writing " + shortDim, written + dimWritten, totalChunks);
+                    }
 
                     try {
                         CompoundTag chunkNbt = buildChunkNbt(packet, ops, blockCodec, biomeCodec, registryAccess);
@@ -296,9 +352,11 @@ public class FbrWorldConverter {
                         }).write(pos, entityNbt);
 
                         written++;
+                        dimWritten++;
                     } catch (Exception e) {
                         FbrToWorldMod.LOGGER.warn("[FbrToWorld] Skipped {}/{}: {}", dimId, pos, e.getMessage());
                         skipped++;
+                        dimWritten++;
                     }
                 }
 
@@ -306,6 +364,7 @@ public class FbrWorldConverter {
                 for (RegionFileWriter w : entityWriters.values()) w.close();
             }
 
+            clearActionBar(mc);
             sendMessage(mc, "§a[FbrToWorld] Done! " + written + " chunks written"
                     + (skipped > 0 ? " (" + skipped + " skipped)" : "")
                     + " across " + dimChunkMap.size() + " dimension(s)"
@@ -494,6 +553,29 @@ public class FbrWorldConverter {
         mc.execute(() -> {
             if (mc.gui != null) {
                 mc.gui.getChat().addMessage(Component.literal(message));
+            }
+        });
+    }
+
+    /** Show a progress bar in the action bar (above hotbar). */
+    private static void setActionBar(Minecraft mc, String stage, int done, int total) {
+        int clampedDone = Math.min(done, total);
+        int pct = total > 0 ? (clampedDone * 100 / total) : 0;
+        int filled = pct / 5;  // 0-20
+        String bar = "█".repeat(filled) + "░".repeat(20 - filled);
+        String msg = "§a[FbrToWorld] §f" + stage + " §7[§a" + bar + "§7] §f" + pct + "% §7(" + clampedDone + "/" + total + ")";
+        mc.execute(() -> {
+            if (mc.gui != null) {
+                mc.gui.setOverlayMessage(Component.literal(msg), false);
+            }
+        });
+    }
+
+    /** Clear the action bar. */
+    private static void clearActionBar(Minecraft mc) {
+        mc.execute(() -> {
+            if (mc.gui != null) {
+                mc.gui.setOverlayMessage(Component.literal(""), false);
             }
         });
     }

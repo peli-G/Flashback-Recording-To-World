@@ -1,11 +1,18 @@
 {
   "schemaVersion": 1,
   "id": "fbr-to-world",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "name": "FBR to World",
   "description": "Converts a Flashback .fbr recording file into a playable singleplayer world by reading every chunk from the recording's cache. Use /fbrtoworld <path/to/recording.fbr>",
-  "authors": [],
+  "authors": ["peli_G"],
+  "contact": {
+    "homepage": "https://github.com/peli-G/Flashback-Recording-To-World",
+    "sources": "https://github.com/peli-G/Flashback-Recording-To-World",
+    "issues": "https://github.com/peli-G/Flashback-Recording-To-World/issues"
+
+  },
   "license": "MIT",
+  "icon": "assets/fbr/icon.png",
   "environment": "client",
   "entrypoints": {
     "client": [
