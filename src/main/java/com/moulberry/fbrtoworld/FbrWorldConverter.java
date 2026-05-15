@@ -32,7 +32,7 @@ import java.util.zip.DeflaterOutputStream;
 
 public class FbrWorldConverter {
 
-    private static final int DATA_VERSION = 4189; // 1.21.11 — verify with F3 if needed
+    private static final int DATA_VERSION = net.minecraft.SharedConstants.getCurrentVersion().dataVersion().version();
     private static final String VERSION_NAME = "1.21.11";
 
     public static volatile boolean running = false;
@@ -524,12 +524,31 @@ public class FbrWorldConverter {
         data.putLong("LastPlayed", System.currentTimeMillis());
         data.putInt("version", 19133);
         data.putInt("GameType", 1);
-        data.putInt("SpawnX", 0); data.putInt("SpawnY", 64); data.putInt("SpawnZ", 0);
-        data.putByte("Difficulty", (byte) 1);
+        data.putByte("Difficulty", (byte) 2);
+        data.putByte("DifficultyLocked", (byte) 0);
         data.putByte("initialized", (byte) 1);
         data.putByte("hardcore", (byte) 0);
         data.putByte("allowCommands", (byte) 1);
+        data.putByte("WasModded", (byte) 1);
 
+        // Time & weather
+        data.putLong("Time", 0L);
+        data.putLong("DayTime", 0L);
+        data.putByte("raining", (byte) 0);
+        data.putByte("thundering", (byte) 0);
+        data.putInt("rainTime", 0);
+        data.putInt("thunderTime", 0);
+        data.putInt("clearWeatherTime", 0);
+
+        // Spawn — new compound format matching 1.21.11
+        CompoundTag spawn = new CompoundTag();
+        spawn.put("pos", new net.minecraft.nbt.IntArrayTag(new int[]{8, -64, 8}));
+        spawn.putFloat("pitch", 0.0f);
+        spawn.putFloat("yaw", 0.0f);
+        spawn.putString("dimension", "minecraft:overworld");
+        data.put("spawn", spawn);
+
+        // Version
         CompoundTag version = new CompoundTag();
         version.putString("Name", VERSION_NAME);
         version.putInt("Id", DATA_VERSION);
@@ -537,13 +556,69 @@ public class FbrWorldConverter {
         version.putByte("Snapshot", (byte) 0);
         data.put("Version", version);
 
+        // game_rules — 1.21.11 format: namespaced keys with byte/int values
         CompoundTag gameRules = new CompoundTag();
-        gameRules.putString("doDaylightCycle", "false");
-        gameRules.putString("doWeatherCycle", "false");
-        gameRules.putString("doMobSpawning", "false");
-        gameRules.putString("doFireTick", "false");
-        data.put("GameRules", gameRules);
+        gameRules.putByte("minecraft:advance_time", (byte) 0);
+        gameRules.putByte("minecraft:advance_weather", (byte) 0);
+        gameRules.putByte("minecraft:allow_entering_nether_using_portals", (byte) 1);
+        gameRules.putByte("minecraft:block_drops", (byte) 1);
+        gameRules.putByte("minecraft:block_explosion_drop_decay", (byte) 1);
+        gameRules.putByte("minecraft:command_block_output", (byte) 1);
+        gameRules.putByte("minecraft:command_blocks_work", (byte) 1);
+        gameRules.putByte("minecraft:drowning_damage", (byte) 1);
+        gameRules.putByte("minecraft:elytra_movement_check", (byte) 1);
+        gameRules.putByte("minecraft:ender_pearls_vanish_on_death", (byte) 1);
+        gameRules.putByte("minecraft:entity_drops", (byte) 1);
+        gameRules.putByte("minecraft:fall_damage", (byte) 1);
+        gameRules.putByte("minecraft:fire_damage", (byte) 1);
+        gameRules.putInt("minecraft:fire_spread_radius_around_player", 128);
+        gameRules.putByte("minecraft:forgive_dead_players", (byte) 1);
+        gameRules.putByte("minecraft:freeze_damage", (byte) 1);
+        gameRules.putByte("minecraft:global_sound_events", (byte) 1);
+        gameRules.putByte("minecraft:immediate_respawn", (byte) 0);
+        gameRules.putByte("minecraft:keep_inventory", (byte) 0);
+        gameRules.putByte("minecraft:limited_crafting", (byte) 0);
+        gameRules.putByte("minecraft:lava_source_conversion", (byte) 0);
+        gameRules.putByte("minecraft:locator_bar", (byte) 1);
+        gameRules.putByte("minecraft:log_admin_commands", (byte) 1);
+        gameRules.putInt("minecraft:max_block_modifications", 32768);
+        gameRules.putInt("minecraft:max_command_forks", 65536);
+        gameRules.putInt("minecraft:max_command_sequence_length", 65536);
+        gameRules.putInt("minecraft:max_entity_cramming", 24);
+        gameRules.putInt("minecraft:max_snow_accumulation_height", 1);
+        gameRules.putByte("minecraft:mob_drops", (byte) 1);
+        gameRules.putByte("minecraft:mob_explosion_drop_decay", (byte) 1);
+        gameRules.putByte("minecraft:mob_griefing", (byte) 1);
+        gameRules.putByte("minecraft:natural_health_regeneration", (byte) 1);
+        gameRules.putByte("minecraft:player_movement_check", (byte) 1);
+        gameRules.putInt("minecraft:players_nether_portal_creative_delay", 0);
+        gameRules.putInt("minecraft:players_nether_portal_default_delay", 80);
+        gameRules.putInt("minecraft:players_sleeping_percentage", 100);
+        gameRules.putByte("minecraft:projectiles_can_break_blocks", (byte) 1);
+        gameRules.putByte("minecraft:pvp", (byte) 1);
+        gameRules.putByte("minecraft:raids", (byte) 1);
+        gameRules.putInt("minecraft:random_tick_speed", 3);
+        gameRules.putByte("minecraft:reduced_debug_info", (byte) 0);
+        gameRules.putInt("minecraft:respawn_radius", 10);
+        gameRules.putByte("minecraft:send_command_feedback", (byte) 1);
+        gameRules.putByte("minecraft:show_advancement_messages", (byte) 1);
+        gameRules.putByte("minecraft:show_death_messages", (byte) 1);
+        gameRules.putByte("minecraft:spawn_mobs", (byte) 0);
+        gameRules.putByte("minecraft:spawn_monsters", (byte) 0);
+        gameRules.putByte("minecraft:spawn_patrols", (byte) 0);
+        gameRules.putByte("minecraft:spawn_phantoms", (byte) 0);
+        gameRules.putByte("minecraft:spawn_wandering_traders", (byte) 0);
+        gameRules.putByte("minecraft:spawn_wardens", (byte) 0);
+        gameRules.putByte("minecraft:spawner_blocks_work", (byte) 1);
+        gameRules.putByte("minecraft:spectators_generate_chunks", (byte) 1);
+        gameRules.putByte("minecraft:spread_vines", (byte) 1);
+        gameRules.putByte("minecraft:tnt_explodes", (byte) 1);
+        gameRules.putByte("minecraft:tnt_explosion_drop_decay", (byte) 0);
+        gameRules.putByte("minecraft:universal_anger", (byte) 0);
+        gameRules.putByte("minecraft:water_source_conversion", (byte) 1);
+        data.put("game_rules", gameRules);
 
+        // DataPacks
         CompoundTag dataPacks = new CompoundTag();
         ListTag enabled = new ListTag();
         enabled.add(StringTag.valueOf("vanilla"));
@@ -551,6 +626,23 @@ public class FbrWorldConverter {
         dataPacks.put("Disabled", new ListTag());
         data.put("DataPacks", dataPacks);
 
+        // DragonFight
+        CompoundTag dragonFight = new CompoundTag();
+        dragonFight.putByte("PreviouslyKilled", (byte) 0);
+        dragonFight.putByte("NeedsStateScanning", (byte) 1);
+        dragonFight.putByte("DragonKilled", (byte) 0);
+        data.put("DragonFight", dragonFight);
+
+        // Misc
+        data.put("CustomBossEvents", new CompoundTag());
+        data.put("ScheduledEvents", new ListTag());
+        ListTag serverBrands = new ListTag();
+        serverBrands.add(StringTag.valueOf("fabric"));
+        data.put("ServerBrands", serverBrands);
+        data.putInt("WanderingTraderSpawnChance", 25);
+        data.putInt("WanderingTraderSpawnDelay", 24000);
+
+        // WorldGenSettings — flat/void for Java, keeps unvisited chunks empty
         CompoundTag worldGenSettings = new CompoundTag();
         worldGenSettings.putLong("seed", 0L);
         worldGenSettings.putByte("generate_features", (byte) 0);
@@ -563,7 +655,8 @@ public class FbrWorldConverter {
         CompoundTag genSettings = new CompoundTag();
         genSettings.put("layers", new ListTag());
         genSettings.putString("biome", "minecraft:plains");
-        genSettings.putByte("structure", (byte) 0);
+        genSettings.putByte("features", (byte) 0);
+        genSettings.putByte("lakes", (byte) 0);
         gen.put("settings", genSettings);
         overworld.put("generator", gen);
         dimensions.put("minecraft:overworld", overworld);

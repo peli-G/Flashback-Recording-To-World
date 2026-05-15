@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "fbr-to-world",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "name": "FBR to World",
   "description": "Converts a Flashback .fbr recording file into a playable singleplayer world by reading every chunk from the recording's cache. Use /fbrtoworld <path/to/recording.fbr>",
   "authors": ["peli_G"],
