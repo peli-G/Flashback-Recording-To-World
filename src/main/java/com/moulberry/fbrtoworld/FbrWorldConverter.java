@@ -7,11 +7,9 @@ import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.*;
+import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.RegistryFriendlyByteBuf;
-import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket;
-import net.minecraft.network.protocol.game.ClientboundLoginPacket;
-import net.minecraft.network.protocol.game.ClientboundRespawnPacket;
-import net.minecraft.network.protocol.game.GameProtocols;
+import net.minecraft.network.protocol.game.*;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.biome.Biomes;
@@ -28,19 +26,17 @@ import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.file.*;
 import java.util.*;
-import java.util.zip.DeflaterOutputStream;
 
 public class FbrWorldConverter {
 
     private static final int DATA_VERSION = net.minecraft.SharedConstants.getCurrentVersion().dataVersion().version();
-    private static final String VERSION_NAME = "1.21.11";
+    private static final String VERSION_NAME = net.minecraft.SharedConstants.getCurrentVersion().name();
 
     public static volatile boolean running = false;
 
     public static boolean start(Path fbrPath, RegistryAccess registryAccess, Minecraft mc) {
         if (running) return false;
         running = true;
-
         Thread t = new Thread(() -> {
             try {
                 convert(fbrPath, registryAccess, mc);
@@ -57,17 +53,17 @@ public class FbrWorldConverter {
         return true;
     }
 
+    // ── Main conversion ───────────────────────────────────────────────────────
+
     private static void convert(Path fbrPath, RegistryAccess registryAccess, Minecraft mc) throws Exception {
         if (!Files.exists(fbrPath)) {
             sendMessage(mc, "§c[FbrToWorld] File not found: " + fbrPath);
             return;
         }
-
         sendMessage(mc, "§a[FbrToWorld] Opening " + fbrPath.getFileName() + " ...");
 
         try (FileSystem zip = FileSystems.newFileSystem(fbrPath)) {
 
-            // ── Find all level_chunk_cache files ──────────────────────────
             Path cacheDir = zip.getPath("/level_chunk_caches");
             if (!Files.exists(cacheDir)) {
                 sendMessage(mc, "§c[FbrToWorld] No level_chunk_caches found — may be an older .fbr format.");
@@ -79,200 +75,125 @@ public class FbrWorldConverter {
                 for (Path p : ds) cacheFiles.add(p);
             }
             cacheFiles.sort(Comparator.comparingInt(p -> Integer.parseInt(p.getFileName().toString())));
+            int totalCacheFiles = cacheFiles.size();
 
-            sendMessage(mc, "§a[FbrToWorld] Found " + cacheFiles.size() + " cache file(s). Decoding...");
+            List<Path> flashbackFiles = new ArrayList<>();
+            try (DirectoryStream<Path> ds = Files.newDirectoryStream(zip.getPath("/"))) {
+                for (Path p : ds)
+                    if (p.getFileName().toString().endsWith(".flashback")) flashbackFiles.add(p);
+            }
+            flashbackFiles.sort(Comparator.comparing(p -> p.getFileName().toString()));
+            int totalFbFiles = flashbackFiles.size();
 
-            // ── Build the game packet codec — same pattern as Flashback 1.21.11 ──
             var gamePacketCodec = GameProtocols.CLIENTBOUND_TEMPLATE
                     .bind(RegistryFriendlyByteBuf.decorator(registryAccess))
                     .codec();
 
-            // ── Step 1: Load all chunk packets into a flat index → packet list ──
-            // Flashback stores chunks in a flat indexed array across all dimensions.
-            // Each index references a unique chunk packet regardless of dimension.
-            List<ClientboundLevelChunkWithLightPacket> chunkPacketsByIndex = new ArrayList<>();
-            int totalCacheFiles = cacheFiles.size();
+            // ═══════════════════════════════════════════════════════════════
+            // PHASE 1 — Lightweight position index
+            // Read only the first ~16 bytes of each cache entry (VarInt ID +
+            // x int + z int). Skip the rest without allocating a buffer.
+            // Result: indexToXZ[globalIndex] = [x, z]
+            // ═══════════════════════════════════════════════════════════════
+            sendMessage(mc, "§a[FbrToWorld] Phase 1/3: Indexing chunk positions...");
+
+            Map<Integer, int[]> indexToXZ = new HashMap<>();
+            int totalPackets = 0;
+            byte[] headBuf = new byte[16];
+
             for (int cfi = 0; cfi < totalCacheFiles; cfi++) {
-                Path cacheFile = cacheFiles.get(cfi);
-                setActionBar(mc, "Loading chunks", cfi + 1, totalCacheFiles);
-                try (InputStream is = Files.newInputStream(cacheFile)) {
+                setActionBar(mc, "Indexing cache", cfi + 1, totalCacheFiles);
+                try (InputStream is = Files.newInputStream(cacheFiles.get(cfi))) {
                     while (true) {
-                        byte[] sizeBytes = is.readNBytes(4);
-                        if (sizeBytes.length < 4) break;
-                        int size = ((sizeBytes[0] & 0xff) << 24) | ((sizeBytes[1] & 0xff) << 16)
-                                 | ((sizeBytes[2] & 0xff) << 8) | (sizeBytes[3] & 0xff);
-                        byte[] data = is.readNBytes(size);
-                        if (data.length < size) break;
-                        var buf = new RegistryFriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(data), registryAccess);
-                        try {
-                            var pkt = gamePacketCodec.decode(buf);
-                            if (pkt instanceof ClientboundLevelChunkWithLightPacket cp) {
-                                chunkPacketsByIndex.add(cp);
-                            }
-                        } catch (Exception e) {
-                            FbrToWorldMod.LOGGER.warn("[FbrToWorld] Failed to decode chunk: {}", e.getMessage());
-                            chunkPacketsByIndex.add(null); // keep index alignment
+                        byte[] sb = is.readNBytes(4);
+                        if (sb.length < 4) break;
+                        int size = readInt4(sb, 0);
+                        if (size <= 0) break;
+
+                        int headLen = Math.min(size, 16);
+                        int got = is.readNBytes(headBuf, 0, headLen);
+                        if (got < headLen) break;
+
+                        skipFully(is, size - headLen);
+
+                        int vi = varIntLength(headBuf, got);
+                        if (got >= vi + 8) {
+                            indexToXZ.put(totalPackets, new int[]{
+                                readInt4(headBuf, vi),
+                                readInt4(headBuf, vi + 4)
+                            });
                         }
+                        totalPackets++;
                     }
                 }
             }
 
-            // ── Step 2: Scan .flashback action files to map chunk index → dimension ──
-            // Login and Respawn packets in ActionGamePacket entries tell us the current
-            // dimension. ActionLevelChunkCached entries tell us which chunk index was sent.
-            // We track the last-known dimension for each chunk index (last write wins).
-            Map<String, Map<Long, ClientboundLevelChunkWithLightPacket>> dimChunkMap = new LinkedHashMap<>();
-            String[] currentDimension = {"minecraft:overworld"}; // default
+            sendMessage(mc, "§a[FbrToWorld] Phase 1 done: " + indexToXZ.size()
+                    + " of " + totalPackets + " entries indexed.");
 
-            // Find all .flashback chunk files sorted by name
-            List<Path> flashbackFiles = new ArrayList<>();
-            try (DirectoryStream<Path> ds = Files.newDirectoryStream(zip.getPath("/"))) {
-                for (Path p : ds) {
-                    String name = p.getFileName().toString();
-                    if (name.endsWith(".flashback")) flashbackFiles.add(p);
-                }
-            }
-            flashbackFiles.sort(Comparator.comparing(p -> p.getFileName().toString()));
+            // ═══════════════════════════════════════════════════════════════
+            // PHASE 2 — Timeline scan
+            // Walk .flashback files, track dimension via Login/Respawn packets,
+            // record which chunk index was last used per (dim, chunkPos).
+            // Last write wins — matches the original single-pass behaviour.
+            // ═══════════════════════════════════════════════════════════════
+            sendMessage(mc, "§a[FbrToWorld] Phase 2/3: Scanning timeline...");
 
+            Map<String, Map<Long, Integer>> dimPosToWinnerIndex = new LinkedHashMap<>();
+            String[] currentDim = {"minecraft:overworld"};
             final int MAGIC = 0xD780E884;
-            int totalFbFiles = flashbackFiles.size();
-            for (int fbi = 0; fbi < totalFbFiles; fbi++) {
-                Path fbFile = flashbackFiles.get(fbi);
-                setActionBar(mc, "Scanning timeline", fbi + 1, totalFbFiles);
-                byte[] fbBytes = Files.readAllBytes(fbFile);
-                io.netty.buffer.ByteBuf raw = io.netty.buffer.Unpooled.wrappedBuffer(fbBytes);
-                net.minecraft.network.FriendlyByteBuf fbuf = new net.minecraft.network.FriendlyByteBuf(raw);
 
-                int magic = fbuf.readInt();
-                if (magic != MAGIC) {
-                    FbrToWorldMod.LOGGER.warn("[FbrToWorld] Bad magic in {}", fbFile.getFileName());
+            for (int fbi = 0; fbi < totalFbFiles; fbi++) {
+                setActionBar(mc, "Scanning timeline", fbi + 1, totalFbFiles);
+                byte[] fbBytes = Files.readAllBytes(flashbackFiles.get(fbi));
+                FriendlyByteBuf fbuf = new FriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(fbBytes));
+
+                if (fbuf.readInt() != MAGIC) {
+                    FbrToWorldMod.LOGGER.warn("[FbrToWorld] Bad magic in {}", flashbackFiles.get(fbi).getFileName());
                     continue;
                 }
 
-                // Read action name table
                 int actionCount = fbuf.readVarInt();
                 List<String> actionNames = new ArrayList<>();
-                for (int i = 0; i < actionCount; i++) {
-                    actionNames.add(fbuf.readUtf(32767)); // identifier as string
-                }
+                for (int i = 0; i < actionCount; i++) actionNames.add(fbuf.readUtf(32767));
 
-                // Identify the action IDs we care about
-                int gamePacketActionId = -1, levelChunkCachedActionId = -1;
+                int gamePacketId = -1, chunkCachedId = -1;
                 for (int i = 0; i < actionNames.size(); i++) {
-                    String name = actionNames.get(i);
-                    if (name.equals("flashback:action/game_packet")) gamePacketActionId = i;
-                    if (name.equals("flashback:action/level_chunk_cached")) levelChunkCachedActionId = i;
+                    if ("flashback:action/game_packet".equals(actionNames.get(i)))          gamePacketId  = i;
+                    if ("flashback:action/level_chunk_cached".equals(actionNames.get(i)))   chunkCachedId = i;
                 }
 
-                // Read snapshot — must scan it for Login packet and initial chunk indices,
-                // but treat it as a separate bounded section to avoid byte misalignment.
-                int snapshotSize = fbuf.readInt();
-                byte[] snapshotBytes = new byte[snapshotSize];
-                fbuf.readBytes(snapshotBytes);
-                net.minecraft.network.FriendlyByteBuf snapBuf = new net.minecraft.network.FriendlyByteBuf(
-                        io.netty.buffer.Unpooled.wrappedBuffer(snapshotBytes));
+                // Snapshot section
+                int snapSize = fbuf.readInt();
+                byte[] snapBytes = new byte[snapSize];
+                fbuf.readBytes(snapBytes);
+                FriendlyByteBuf snapBuf = new FriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(snapBytes));
+                scanActions(snapBuf, gamePacketId, chunkCachedId,
+                        gamePacketCodec, registryAccess, indexToXZ, currentDim, dimPosToWinnerIndex);
 
-                // Scan snapshot actions
-                while (snapBuf.readableBytes() > 0) {
-                    int actionId = snapBuf.readVarInt();
-                    int dataSize = snapBuf.readInt();
-                    byte[] actionData = new byte[dataSize];
-                    snapBuf.readBytes(actionData);
-
-                    if (actionId == gamePacketActionId) {
-                        var actionBuf = new RegistryFriendlyByteBuf(
-                                io.netty.buffer.Unpooled.wrappedBuffer(actionData), registryAccess);
-                        try {
-                            var pkt = gamePacketCodec.decode(actionBuf);
-                            String dimStr = null;
-                            if (pkt instanceof ClientboundLoginPacket lp) {
-                                dimStr = lp.commonPlayerSpawnInfo().dimension().toString();
-                            } else if (pkt instanceof ClientboundRespawnPacket rp) {
-                                dimStr = rp.commonPlayerSpawnInfo().dimension().toString();
-                            }
-                            if (dimStr != null) {
-                                int slash = dimStr.indexOf('/');
-                                currentDimension[0] = slash >= 0
-                                        ? dimStr.substring(slash + 2, dimStr.length() - 1).trim()
-                                        : "minecraft:overworld";
-                            }
-                        } catch (Exception ignored) {}
-                    } else if (actionId == levelChunkCachedActionId) {
-                        net.minecraft.network.FriendlyByteBuf indexBuf = new net.minecraft.network.FriendlyByteBuf(
-                                io.netty.buffer.Unpooled.wrappedBuffer(actionData));
-                        int chunkIndex = indexBuf.readVarInt();
-                        if (chunkIndex >= 0 && chunkIndex < chunkPacketsByIndex.size()) {
-                            ClientboundLevelChunkWithLightPacket cp = chunkPacketsByIndex.get(chunkIndex);
-                            if (cp != null) {
-                                dimChunkMap.computeIfAbsent(currentDimension[0], k -> new LinkedHashMap<>())
-                                        .put(ChunkPos.asLong(cp.getX(), cp.getZ()), cp);
-                            }
-                        }
-                    }
-                }
-
-                // Now scan main actions
-                while (fbuf.readableBytes() > 0) {
-                    int actionId = fbuf.readVarInt();
-                    int dataSize = fbuf.readInt();
-
-                    if (actionId == gamePacketActionId) {
-                        // Try to decode this packet and check if it's Login or Respawn
-                        byte[] actionData = new byte[dataSize];
-                        fbuf.readBytes(actionData);
-                        var actionBuf = new RegistryFriendlyByteBuf(
-                                io.netty.buffer.Unpooled.wrappedBuffer(actionData), registryAccess);
-                        try {
-                            var pkt = gamePacketCodec.decode(actionBuf);
-                            // ResourceKey.toString() = "ResourceKey[minecraft:dimension / minecraft:overworld]"
-                            // .location() doesn't exist in 1.21.11 — parse toString() instead
-                            String dimStr = null;
-                            if (pkt instanceof ClientboundLoginPacket lp) {
-                                dimStr = lp.commonPlayerSpawnInfo().dimension().toString();
-                            } else if (pkt instanceof ClientboundRespawnPacket rp) {
-                                dimStr = rp.commonPlayerSpawnInfo().dimension().toString();
-                            }
-                            if (dimStr != null) {
-                                int slash = dimStr.indexOf('/');
-                                currentDimension[0] = slash >= 0
-                                        ? dimStr.substring(slash + 2, dimStr.length() - 1).trim()
-                                        : "minecraft:overworld";
-                            }
-                        } catch (Exception ignored) {}
-
-                    } else if (actionId == levelChunkCachedActionId) {
-                        byte[] actionData = new byte[dataSize];
-                        fbuf.readBytes(actionData);
-                        net.minecraft.network.FriendlyByteBuf indexBuf = new net.minecraft.network.FriendlyByteBuf(
-                                io.netty.buffer.Unpooled.wrappedBuffer(actionData));
-                        int chunkIndex = indexBuf.readVarInt();
-
-                        if (chunkIndex >= 0 && chunkIndex < chunkPacketsByIndex.size()) {
-                            ClientboundLevelChunkWithLightPacket cp = chunkPacketsByIndex.get(chunkIndex);
-                            if (cp != null) {
-                                String dim = currentDimension[0];
-                                dimChunkMap.computeIfAbsent(dim, k -> new LinkedHashMap<>())
-                                        .put(ChunkPos.asLong(cp.getX(), cp.getZ()), cp);
-                            }
-                        }
-                    } else {
-                        fbuf.skipBytes(dataSize);
-                    }
-                }
+                // Main section
+                scanActions(fbuf, gamePacketId, chunkCachedId,
+                        gamePacketCodec, registryAccess, indexToXZ, currentDim, dimPosToWinnerIndex);
             }
 
-            int totalChunks = dimChunkMap.values().stream().mapToInt(Map::size).sum();
-            sendMessage(mc, "§a[FbrToWorld] " + chunkPacketsByIndex.size() + " packets decoded → "
-                    + totalChunks + " unique chunk positions across " + dimChunkMap.size() + " dimension(s).");
+            // Build reverse map: winner cache index → dim
+            Map<Integer, String> winnerIndexToDim = new HashMap<>();
+            for (var e : dimPosToWinnerIndex.entrySet())
+                for (int idx : e.getValue().values())
+                    winnerIndexToDim.put(idx, e.getKey());
 
-            if (dimChunkMap.isEmpty()) {
+            int totalChunks = winnerIndexToDim.size();
+            sendMessage(mc, "§a[FbrToWorld] Phase 2 done: " + totalChunks + " unique chunks across "
+                    + dimPosToWinnerIndex.size() + " dimension(s).");
+
+            if (dimPosToWinnerIndex.isEmpty()) {
                 sendMessage(mc, "§c[FbrToWorld] No chunks found — nothing to export.");
                 return;
             }
 
-            // ── Create output world folder ────────────────────────────────
+            // Create output world
             String baseName = fbrPath.getFileName().toString()
-                    .replaceAll("\\.[^.]+$", "")       // strip extension
+                    .replaceAll("\\.[^.]+$", "")
                     .replaceAll("[\\\\/:*?\"<>|]", "_");
             Path savesDir = mc.gameDirectory.toPath().resolve("saves");
             Path worldPath = savesDir.resolve(baseName);
@@ -284,91 +205,196 @@ public class FbrWorldConverter {
             Files.createDirectories(worldPath);
             writeLevelDat(worldPath, baseName);
 
-            // ── Codec setup ───────────────────────────────────────────────
             var biomeRegistry = registryAccess.lookupOrThrow(Registries.BIOME);
-            var ops = registryAccess.createSerializationContext(NbtOps.INSTANCE);
-
-            var blockCodec = PalettedContainer.codecRW(
+            var ops            = registryAccess.createSerializationContext(NbtOps.INSTANCE);
+            var blockCodec     = PalettedContainer.codecRW(
                     BlockState.CODEC,
                     Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY),
                     Blocks.AIR.defaultBlockState());
-
             com.mojang.serialization.Codec<PalettedContainerRO<Holder<Biome>>> biomeCodec = PalettedContainer.codecRO(
                     biomeRegistry.holderByNameCodec(),
                     Strategy.createForBiomes(biomeRegistry.asHolderIdMap()),
                     biomeRegistry.getOrThrow(Biomes.PLAINS));
 
-            // ── Write chunks per dimension ────────────────────────────────
-            int written = 0, skipped = 0;
-
-            for (Map.Entry<String, Map<Long, ClientboundLevelChunkWithLightPacket>> dimEntry : dimChunkMap.entrySet()) {
-                String dimId = dimEntry.getKey();   // e.g. "minecraft:overworld"
-                Map<Long, ClientboundLevelChunkWithLightPacket> chunkMap = dimEntry.getValue();
-
-                // Resolve the correct subfolder for each dimension
-                Path dimPath = worldPath;
-                if (dimId.equals("minecraft:the_nether")) {
-                    dimPath = worldPath.resolve("DIM-1");
-                } else if (dimId.equals("minecraft:the_end")) {
-                    dimPath = worldPath.resolve("DIM1");
-                } else if (!dimId.equals("minecraft:overworld")) {
-                    // Custom dimensions: saves/<world>/dimensions/<namespace>/<path>
-                    String[] parts = dimId.split(":", 2);
-                    dimPath = worldPath.resolve("dimensions").resolve(parts[0]).resolve(parts[1]);
-                }
-
-                Files.createDirectories(dimPath.resolve("region"));
-                Files.createDirectories(dimPath.resolve("entities"));
-
-                Map<Long, RegionFileWriter> regionWriters = new HashMap<>();
-                Map<Long, RegionFileWriter> entityWriters = new HashMap<>();
-
-                int dimTotal = chunkMap.size();
-                int dimWritten = 0;
-                for (ClientboundLevelChunkWithLightPacket packet : chunkMap.values()) {
-                    ChunkPos pos = new ChunkPos(packet.getX(), packet.getZ());
-                    long regionKey = ChunkPos.asLong(pos.getRegionX(), pos.getRegionZ());
-                    String regionName = "r." + pos.getRegionX() + "." + pos.getRegionZ() + ".mca";
-
-                    // Update action bar every 16 chunks to avoid hammering the main thread
-                    if (dimWritten % 16 == 0) {
-                        String shortDim = dimId.contains(":") ? dimId.split(":")[1] : dimId;
-                        setActionBar(mc, "Writing " + shortDim, written + dimWritten, totalChunks);
-                    }
-
-                    try {
-                        CompoundTag chunkNbt = buildChunkNbt(packet, ops, blockCodec, biomeCodec, registryAccess);
-                        CompoundTag entityNbt = buildEntityChunkNbt(pos);
-
-                        final Path dPath = dimPath;
-                        regionWriters.computeIfAbsent(regionKey, k -> {
-                            try { return new RegionFileWriter(dPath.resolve("region").resolve(regionName)); }
-                            catch (Exception e) { throw new RuntimeException(e); }
-                        }).write(pos, chunkNbt);
-
-                        entityWriters.computeIfAbsent(regionKey, k -> {
-                            try { return new RegionFileWriter(dPath.resolve("entities").resolve(regionName)); }
-                            catch (Exception e) { throw new RuntimeException(e); }
-                        }).write(pos, entityNbt);
-
-                        written++;
-                        dimWritten++;
-                    } catch (Exception e) {
-                        FbrToWorldMod.LOGGER.warn("[FbrToWorld] Skipped {}/{}: {}", dimId, pos, e.getMessage());
-                        skipped++;
-                        dimWritten++;
-                    }
-                }
-
-                for (RegionFileWriter w : regionWriters.values()) w.close();
-                for (RegionFileWriter w : entityWriters.values()) w.close();
+            Map<String, Path> dimPaths = new LinkedHashMap<>();
+            for (String dimId : dimPosToWinnerIndex.keySet()) {
+                Path dp = resolveDimPath(worldPath, dimId);
+                Files.createDirectories(dp.resolve("region"));
+                Files.createDirectories(dp.resolve("entities"));
+                dimPaths.put(dimId, dp);
             }
+
+            // ═══════════════════════════════════════════════════════════════
+            // PHASE 3 — Streaming write
+            // Walk cache files a second time. Non-winners: skipFully() with
+            // zero allocation. Winners: readNBytes() → decode → write → discard.
+            // Peak heap: one decoded chunk at a time, regardless of file size.
+            // ═══════════════════════════════════════════════════════════════
+            sendMessage(mc, "§a[FbrToWorld] Phase 3/3: Writing chunks...");
+
+            Map<String, Map<Long, RegionFileWriter>> regionWriters = new HashMap<>();
+            Map<String, Map<Long, RegionFileWriter>> entityWriters = new HashMap<>();
+            int written = 0, skipped = 0;
+            int globalIndex = 0;
+
+            for (int cfi = 0; cfi < totalCacheFiles; cfi++) {
+                try (InputStream is = Files.newInputStream(cacheFiles.get(cfi))) {
+                    while (true) {
+                        byte[] sb = is.readNBytes(4);
+                        if (sb.length < 4) break;
+                        int size = readInt4(sb, 0);
+                        if (size <= 0) break;
+
+                        int idx = globalIndex++;
+                        String dim = winnerIndexToDim.get(idx);
+
+                        if (dim == null) {
+                            skipFully(is, size);
+                            continue;
+                        }
+
+                        if (written % 16 == 0) {
+                            String shortDim = dim.contains(":") ? dim.split(":")[1] : dim;
+                            setActionBar(mc, "Writing " + shortDim, written, totalChunks);
+                        }
+
+                        byte[] data = is.readNBytes(size);
+                        if (data.length < size) break;
+
+                        var buf = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(data), registryAccess);
+                        try {
+                            var pkt = gamePacketCodec.decode(buf);
+                            if (pkt instanceof ClientboundLevelChunkWithLightPacket cp) {
+                                ChunkPos pos      = new ChunkPos(cp.getX(), cp.getZ());
+                                long regionKey    = ChunkPos.asLong(pos.getRegionX(), pos.getRegionZ());
+                                String regionName = "r." + pos.getRegionX() + "." + pos.getRegionZ() + ".mca";
+                                Path dimPath      = dimPaths.get(dim);
+
+                                CompoundTag chunkNbt  = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess);
+                                CompoundTag entityNbt = buildEntityChunkNbt(pos);
+
+                                final Path dPath  = dimPath;
+                                final String fDim = dim;
+                                regionWriters.computeIfAbsent(fDim, k -> new HashMap<>())
+                                        .computeIfAbsent(regionKey, k -> {
+                                            try { return new RegionFileWriter(dPath.resolve("region").resolve(regionName)); }
+                                            catch (Exception e) { throw new RuntimeException(e); }
+                                        }).write(pos, chunkNbt);
+                                entityWriters.computeIfAbsent(fDim, k -> new HashMap<>())
+                                        .computeIfAbsent(regionKey, k -> {
+                                            try { return new RegionFileWriter(dPath.resolve("entities").resolve(regionName)); }
+                                            catch (Exception e) { throw new RuntimeException(e); }
+                                        }).write(pos, entityNbt);
+
+                                written++;
+                            }
+                        } catch (Exception e) {
+                            FbrToWorldMod.LOGGER.warn("[FbrToWorld] Skipped {}/idx {}: {}", dim, idx, e.getMessage());
+                            skipped++;
+                        }
+                    }
+                }
+            }
+
+            for (var m : regionWriters.values()) for (var w : m.values()) w.close();
+            for (var m : entityWriters.values()) for (var w : m.values()) w.close();
 
             clearActionBar(mc);
             sendMessage(mc, "§a[FbrToWorld] Done! " + written + " chunks written"
                     + (skipped > 0 ? " (" + skipped + " skipped)" : "")
-                    + " across " + dimChunkMap.size() + " dimension(s)"
+                    + " across " + dimPosToWinnerIndex.size() + " dimension(s)"
                     + " → saves/" + worldPath.getFileName());
+        }
+    }
+
+    // ── Timeline scanner ──────────────────────────────────────────────────────
+
+    private static void scanActions(
+            FriendlyByteBuf buf,
+            int gamePacketId,
+            int chunkCachedId,
+            net.minecraft.network.codec.StreamCodec<io.netty.buffer.ByteBuf, net.minecraft.network.protocol.Packet<? super net.minecraft.network.protocol.game.ClientGamePacketListener>> codec,
+            RegistryAccess registryAccess,
+            Map<Integer, int[]> indexToXZ,
+            String[] currentDim,
+            Map<String, Map<Long, Integer>> dimPosToWinnerIndex) {
+
+        while (buf.readableBytes() > 0) {
+            int actionId = buf.readVarInt();
+            int dataSize = buf.readInt();
+
+            if (actionId == gamePacketId) {
+                byte[] actionData = new byte[dataSize];
+                buf.readBytes(actionData);
+                var actionBuf = new RegistryFriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(actionData), registryAccess);
+                try {
+                    var pkt = codec.decode(actionBuf);
+                    String dimStr = null;
+                    if (pkt instanceof ClientboundLoginPacket   lp) dimStr = lp.commonPlayerSpawnInfo().dimension().toString();
+                    else if (pkt instanceof ClientboundRespawnPacket rp) dimStr = rp.commonPlayerSpawnInfo().dimension().toString();
+                    if (dimStr != null) {
+                        int slash = dimStr.indexOf('/');
+                        currentDim[0] = slash >= 0
+                                ? dimStr.substring(slash + 2, dimStr.length() - 1).trim()
+                                : "minecraft:overworld";
+                    }
+                } catch (Exception ignored) {}
+
+            } else if (actionId == chunkCachedId) {
+                byte[] actionData = new byte[dataSize];
+                buf.readBytes(actionData);
+                FriendlyByteBuf indexBuf = new FriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(actionData));
+                int chunkIndex = indexBuf.readVarInt();
+                int[] xz = indexToXZ.get(chunkIndex);
+                if (xz != null) {
+                    dimPosToWinnerIndex
+                            .computeIfAbsent(currentDim[0], k -> new LinkedHashMap<>())
+                            .put(ChunkPos.asLong(xz[0], xz[1]), chunkIndex);
+                }
+
+            } else {
+                buf.skipBytes(dataSize);
+            }
+        }
+    }
+
+    // ── Dimension path ────────────────────────────────────────────────────────
+
+    private static Path resolveDimPath(Path worldPath, String dimId) {
+        return switch (dimId) {
+            case "minecraft:overworld"  -> worldPath;
+            case "minecraft:the_nether" -> worldPath.resolve("DIM-1");
+            case "minecraft:the_end"    -> worldPath.resolve("DIM1");
+            default -> {
+                String[] parts = dimId.split(":", 2);
+                yield worldPath.resolve("dimensions").resolve(parts[0]).resolve(parts[1]);
+            }
+        };
+    }
+
+    // ── Byte utilities ────────────────────────────────────────────────────────
+
+    private static int readInt4(byte[] b, int off) {
+        return ((b[off] & 0xff) << 24) | ((b[off + 1] & 0xff) << 16)
+             | ((b[off + 2] & 0xff) << 8)  |  (b[off + 3] & 0xff);
+    }
+
+    private static int varIntLength(byte[] b, int validLen) {
+        for (int i = 0; i < validLen && i < 5; i++) {
+            if ((b[i] & 0x80) == 0) return i + 1;
+        }
+        return 1;
+    }
+
+    private static void skipFully(InputStream is, long n) throws IOException {
+        while (n > 0) {
+            long s = is.skip(n);
+            if (s > 0) { n -= s; continue; }
+            int chunk = (int) Math.min(n, 8192);
+            byte[] discard = new byte[chunk];
+            int r = is.read(discard, 0, chunk);
+            if (r < 0) break;
+            n -= r;
         }
     }
 
@@ -386,40 +412,30 @@ public class FbrWorldConverter {
         int cz = packet.getZ();
         var chunkData = packet.getChunkData();
 
-        // chunkData.buffer and .blockEntitiesData are private — access via widener
-        // (declared in fbr-to-world.accesswidener)
-        byte[] rawBuffer = ((ClientboundLevelChunkPacketDataAccessor) (Object) chunkData).fbr$getBuffer();
-        List<?> beInfoList =
-                ((ClientboundLevelChunkPacketDataAccessor) (Object) chunkData).fbr$getBlockEntitiesData();
+        byte[] rawBuffer  = ((ClientboundLevelChunkPacketDataAccessor)(Object) chunkData).fbr$getBuffer();
+        List<?> beInfoList = ((ClientboundLevelChunkPacketDataAccessor)(Object) chunkData).fbr$getBlockEntitiesData();
 
         var rfbb = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(rawBuffer), registryAccess);
 
-        // Overworld: 24 sections from y=-64 (sectionY=-4) to y=319 (sectionY=19)
-        int minSectionY = -4;
+        int minSectionY  = -4;
         int sectionCount = 24;
         ListTag sections = new ListTag();
 
-        // Get default biome holder for PalettedContainer construction
-        var biomeRegistry = registryAccess.lookupOrThrow(Registries.BIOME);
+        var biomeRegistry  = registryAccess.lookupOrThrow(Registries.BIOME);
         Holder<Biome> defaultBiome = biomeRegistry.getOrThrow(Biomes.PLAINS);
 
-        // ── Extract light data from the packet ───────────────────────────────
-        // Light sections cover (minSectionY-1) to (minSectionY+sectionCount), i.e. 26 entries
-        // for the overworld. Section si corresponds to light index si+1.
-        var lightData = packet.getLightData();
-        java.util.BitSet skyMask   = lightData.getSkyYMask();
-        java.util.BitSet blockMask = lightData.getBlockYMask();
-        java.util.BitSet emptySky   = lightData.getEmptySkyYMask();
-        java.util.BitSet emptyBlock = lightData.getEmptyBlockYMask();
-        java.util.List<byte[]> skyArrays   = lightData.getSkyUpdates();
-        java.util.List<byte[]> blockArrays = lightData.getBlockUpdates();
+        var lightData   = packet.getLightData();
+        var skyMask     = lightData.getSkyYMask();
+        var blockMask   = lightData.getBlockYMask();
+        var emptySky    = lightData.getEmptySkyYMask();
+        var emptyBlock  = lightData.getEmptyBlockYMask();
+        var skyArrays   = lightData.getSkyUpdates();
+        var blockArrays = lightData.getBlockUpdates();
 
-        // Build index-to-array maps from the packed bit arrays
-        // (only set bits in skyMask/blockMask have an array entry)
-        java.util.Map<Integer, byte[]> skyBySection   = new java.util.HashMap<>();
-        java.util.Map<Integer, byte[]> blockBySection = new java.util.HashMap<>();
+        Map<Integer, byte[]> skyBySection   = new HashMap<>();
+        Map<Integer, byte[]> blockBySection = new HashMap<>();
         int skyIdx = 0, blockIdx = 0;
-        int totalLightSections = sectionCount + 2; // one below, one above
+        int totalLightSections = sectionCount + 2;
         for (int li = 0; li < totalLightSections; li++) {
             if (skyMask.get(li)   && skyIdx   < skyArrays.size())   skyBySection.put(li,   skyArrays.get(skyIdx++));
             if (blockMask.get(li) && blockIdx < blockArrays.size()) blockBySection.put(li, blockArrays.get(blockIdx++));
@@ -430,34 +446,28 @@ public class FbrWorldConverter {
             CompoundTag sec = new CompoundTag();
             sec.putInt("Y", sectionY);
 
-            rfbb.readShort(); // non-empty block count — discard
+            rfbb.readShort();
 
-            // Read block states directly from binary packet format
-            PalettedContainer<BlockState> states = new PalettedContainer<BlockState>(
+            PalettedContainer<BlockState> states = new PalettedContainer<>(
                     Blocks.AIR.defaultBlockState(),
                     Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY));
             states.read(rfbb);
 
-            // Read biomes directly from binary packet format
-            PalettedContainer<Holder<Biome>> biomes = new PalettedContainer<Holder<Biome>>(
+            PalettedContainer<Holder<Biome>> biomes = new PalettedContainer<>(
                     defaultBiome,
                     Strategy.createForBiomes(biomeRegistry.asHolderIdMap()));
             biomes.read(rfbb);
 
-            // Encode to NBT for the world save file
-            blockCodec.encodeStart(ops, states).result()
-                    .ifPresent(tag -> sec.put("block_states", tag));
-            biomeCodec.encodeStart(ops, biomes).result()
-                    .ifPresent(tag -> sec.put("biomes", tag));
+            blockCodec.encodeStart(ops, states).result().ifPresent(t -> sec.put("block_states", t));
+            biomeCodec.encodeStart(ops, biomes).result().ifPresent(t -> sec.put("biomes", t));
 
-            // Write light arrays — light index is si+1 (offset by one extra section below)
             int li = si + 1;
             byte[] skyArr   = skyBySection.get(li);
             byte[] blockArr = blockBySection.get(li);
-            if (skyArr != null)   sec.putByteArray("SkyLight",   skyArr);
-            else if (!emptySky.get(li))   sec.putByteArray("SkyLight",   new byte[2048]); // all dark
+            if (skyArr   != null) sec.putByteArray("SkyLight",   skyArr);
+            else if (!emptySky.get(li))   sec.putByteArray("SkyLight",   new byte[2048]);
             if (blockArr != null) sec.putByteArray("BlockLight", blockArr);
-            else if (!emptyBlock.get(li)) sec.putByteArray("BlockLight", new byte[2048]); // all dark
+            else if (!emptyBlock.get(li)) sec.putByteArray("BlockLight", new byte[2048]);
 
             sections.add(sec);
         }
@@ -465,45 +475,39 @@ public class FbrWorldConverter {
         ListTag blockEntities = new ListTag();
         for (var beInfoRaw : beInfoList) {
             try {
-                Class<?> beInfoClass = beInfoRaw.getClass();
-                java.lang.reflect.Field fPackedXZ = beInfoClass.getDeclaredField("packedXZ");
-                java.lang.reflect.Field fY         = beInfoClass.getDeclaredField("y");
-                java.lang.reflect.Field fType      = beInfoClass.getDeclaredField("type");
-                java.lang.reflect.Field fTag       = beInfoClass.getDeclaredField("tag");
-                fPackedXZ.setAccessible(true); fY.setAccessible(true);
-                fType.setAccessible(true);     fTag.setAccessible(true);
+                Class<?> c = beInfoRaw.getClass();
+                var fPackedXZ = c.getDeclaredField("packedXZ"); fPackedXZ.setAccessible(true);
+                var fY        = c.getDeclaredField("y");         fY.setAccessible(true);
+                var fType     = c.getDeclaredField("type");      fType.setAccessible(true);
+                var fTag      = c.getDeclaredField("tag");       fTag.setAccessible(true);
 
                 int packedXZ = (int) fPackedXZ.get(beInfoRaw);
                 int beY      = (int) fY.get(beInfoRaw);
-                net.minecraft.world.level.block.entity.BlockEntityType<?> beType =
-                        (net.minecraft.world.level.block.entity.BlockEntityType<?>) fType.get(beInfoRaw);
-                net.minecraft.nbt.CompoundTag rawTag =
-                        (net.minecraft.nbt.CompoundTag) fTag.get(beInfoRaw);
+                var beType   = (net.minecraft.world.level.block.entity.BlockEntityType<?>) fType.get(beInfoRaw);
+                var rawTag   = (CompoundTag) fTag.get(beInfoRaw);
 
                 int worldX = cx * 16 + (packedXZ >> 4);
                 int worldZ = cz * 16 + (packedXZ & 0xF);
                 CompoundTag beTag = rawTag != null ? rawTag.copy() : new CompoundTag();
                 beTag.putString("id", BuiltInRegistries.BLOCK_ENTITY_TYPE.getKey(beType).toString());
-                beTag.putInt("x", worldX);
-                beTag.putInt("y", beY);
-                beTag.putInt("z", worldZ);
+                beTag.putInt("x", worldX); beTag.putInt("y", beY); beTag.putInt("z", worldZ);
                 beTag.putByte("keepPacked", (byte) 0);
                 blockEntities.add(beTag);
             } catch (Exception ignored) {}
         }
 
         CompoundTag chunk = new CompoundTag();
-        chunk.putInt("DataVersion", DATA_VERSION);
-        chunk.putInt("xPos", cx);
-        chunk.putInt("zPos", cz);
-        chunk.putInt("yPos", minSectionY);
-        chunk.putString("Status", "full");
-        chunk.putLong("LastUpdate", 0L);
+        chunk.putInt("DataVersion",    DATA_VERSION);
+        chunk.putInt("xPos",           cx);
+        chunk.putInt("zPos",           cz);
+        chunk.putInt("yPos",           minSectionY);
+        chunk.putString("Status",      "full");
+        chunk.putLong("LastUpdate",    0L);
         chunk.putLong("InhabitedTime", 0L);
-        chunk.put("sections", sections);
-        chunk.put("block_entities", blockEntities);
-        chunk.put("Heightmaps", new CompoundTag());
-        chunk.putByte("isLightOn", (byte) 1);
+        chunk.put("sections",          sections);
+        chunk.put("block_entities",    blockEntities);
+        chunk.put("Heightmaps",        new CompoundTag());
+        chunk.putByte("isLightOn",     (byte) 1);
         return chunk;
     }
 
@@ -519,44 +523,42 @@ public class FbrWorldConverter {
 
     private static void writeLevelDat(Path worldFolder, String worldName) throws IOException {
         CompoundTag data = new CompoundTag();
-        data.putInt("DataVersion", DATA_VERSION);
+        data.putInt("DataVersion",  DATA_VERSION);
         data.putString("LevelName", worldName);
-        data.putLong("LastPlayed", System.currentTimeMillis());
-        data.putInt("version", 19133);
-        data.putInt("GameType", 1);
-        data.putByte("Difficulty", (byte) 2);
+        data.putLong("LastPlayed",  System.currentTimeMillis());
+        data.putInt("version",      19133);
+        data.putInt("GameType",     1);
+        data.putByte("Difficulty",  (byte) 2);
         data.putByte("DifficultyLocked", (byte) 0);
         data.putByte("initialized", (byte) 1);
-        data.putByte("hardcore", (byte) 0);
+        data.putByte("hardcore",    (byte) 0);
         data.putByte("allowCommands", (byte) 1);
-        data.putByte("WasModded", (byte) 1);
+        data.putByte("WasModded",   (byte) 1);
 
-        // Time & weather
         data.putLong("Time", 0L);
         data.putLong("DayTime", 0L);
-        data.putByte("raining", (byte) 0);
+        data.putByte("raining",   (byte) 0);
         data.putByte("thundering", (byte) 0);
-        data.putInt("rainTime", 0);
+        data.putInt("rainTime",   0);
         data.putInt("thunderTime", 0);
         data.putInt("clearWeatherTime", 0);
+        data.putInt("WanderingTraderSpawnChance", 25);
+        data.putInt("WanderingTraderSpawnDelay",  24000);
 
-        // Spawn — new compound format matching 1.21.11
         CompoundTag spawn = new CompoundTag();
         spawn.put("pos", new net.minecraft.nbt.IntArrayTag(new int[]{8, -64, 8}));
         spawn.putFloat("pitch", 0.0f);
-        spawn.putFloat("yaw", 0.0f);
+        spawn.putFloat("yaw",   0.0f);
         spawn.putString("dimension", "minecraft:overworld");
         data.put("spawn", spawn);
 
-        // Version
         CompoundTag version = new CompoundTag();
-        version.putString("Name", VERSION_NAME);
-        version.putInt("Id", DATA_VERSION);
+        version.putString("Name",   VERSION_NAME);
+        version.putInt("Id",        DATA_VERSION);
         version.putString("Series", "main");
         version.putByte("Snapshot", (byte) 0);
         data.put("Version", version);
 
-        // game_rules — 1.21.11 format: namespaced keys with byte/int values
         CompoundTag gameRules = new CompoundTag();
         gameRules.putByte("minecraft:advance_time", (byte) 0);
         gameRules.putByte("minecraft:advance_weather", (byte) 0);
@@ -618,7 +620,6 @@ public class FbrWorldConverter {
         gameRules.putByte("minecraft:water_source_conversion", (byte) 1);
         data.put("game_rules", gameRules);
 
-        // DataPacks
         CompoundTag dataPacks = new CompoundTag();
         ListTag enabled = new ListTag();
         enabled.add(StringTag.valueOf("vanilla"));
@@ -626,37 +627,33 @@ public class FbrWorldConverter {
         dataPacks.put("Disabled", new ListTag());
         data.put("DataPacks", dataPacks);
 
-        // DragonFight
         CompoundTag dragonFight = new CompoundTag();
-        dragonFight.putByte("PreviouslyKilled", (byte) 0);
-        dragonFight.putByte("NeedsStateScanning", (byte) 1);
-        dragonFight.putByte("DragonKilled", (byte) 0);
+        dragonFight.putByte("PreviouslyKilled",    (byte) 0);
+        dragonFight.putByte("NeedsStateScanning",  (byte) 1);
+        dragonFight.putByte("DragonKilled",        (byte) 0);
         data.put("DragonFight", dragonFight);
 
-        // Misc
         data.put("CustomBossEvents", new CompoundTag());
-        data.put("ScheduledEvents", new ListTag());
+        data.put("ScheduledEvents",  new ListTag());
         ListTag serverBrands = new ListTag();
         serverBrands.add(StringTag.valueOf("fabric"));
         data.put("ServerBrands", serverBrands);
-        data.putInt("WanderingTraderSpawnChance", 25);
-        data.putInt("WanderingTraderSpawnDelay", 24000);
 
-        // WorldGenSettings — flat/void for Java, keeps unvisited chunks empty
+        // Flat generator with no layers — unvisited areas generate nothing
         CompoundTag worldGenSettings = new CompoundTag();
         worldGenSettings.putLong("seed", 0L);
         worldGenSettings.putByte("generate_features", (byte) 0);
-        worldGenSettings.putByte("bonus_chest", (byte) 0);
+        worldGenSettings.putByte("bonus_chest",       (byte) 0);
         CompoundTag dimensions = new CompoundTag();
-        CompoundTag overworld = new CompoundTag();
+        CompoundTag overworld  = new CompoundTag();
         overworld.putString("type", "minecraft:overworld");
         CompoundTag gen = new CompoundTag();
         gen.putString("type", "minecraft:flat");
         CompoundTag genSettings = new CompoundTag();
-        genSettings.put("layers", new ListTag());
+        genSettings.put("layers",  new ListTag());
         genSettings.putString("biome", "minecraft:plains");
         genSettings.putByte("features", (byte) 0);
-        genSettings.putByte("lakes", (byte) 0);
+        genSettings.putByte("lakes",    (byte) 0);
         gen.put("settings", genSettings);
         overworld.put("generator", gen);
         dimensions.put("minecraft:overworld", overworld);
@@ -670,37 +667,30 @@ public class FbrWorldConverter {
                 ByteBuffer.allocate(8).putLong(System.currentTimeMillis()).array());
     }
 
-    // ── Chat ──────────────────────────────────────────────────────────────────
+    // ── Chat / HUD ────────────────────────────────────────────────────────────
 
     private static void sendMessage(Minecraft mc, String message) {
         FbrToWorldMod.LOGGER.info(message);
         mc.execute(() -> {
-            if (mc.gui != null) {
-                mc.gui.getChat().addMessage(Component.literal(message));
-            }
+            if (mc.gui != null) mc.gui.getChat().addMessage(Component.literal(message));
         });
     }
 
-    /** Show a progress bar in the action bar (above hotbar). */
     private static void setActionBar(Minecraft mc, String stage, int done, int total) {
-        int clampedDone = Math.min(done, total);
-        int pct = total > 0 ? (clampedDone * 100 / total) : 0;
-        int filled = pct / 5;  // 0-20
-        String bar = "█".repeat(filled) + "░".repeat(20 - filled);
-        String msg = "§a[FbrToWorld] §f" + stage + " §7[§a" + bar + "§7] §f" + pct + "% §7(" + clampedDone + "/" + total + ")";
+        int clamped = Math.min(done, total);
+        int pct     = total > 0 ? (clamped * 100 / total) : 0;
+        int filled  = pct / 5;
+        String bar  = "█".repeat(filled) + "░".repeat(20 - filled);
+        String msg  = "§a[FbrToWorld] §f" + stage + " §7[§a" + bar + "§7] §f" + pct
+                    + "% §7(" + clamped + "/" + total + ")";
         mc.execute(() -> {
-            if (mc.gui != null) {
-                mc.gui.setOverlayMessage(Component.literal(msg), false);
-            }
+            if (mc.gui != null) mc.gui.setOverlayMessage(Component.literal(msg), false);
         });
     }
 
-    /** Clear the action bar. */
     private static void clearActionBar(Minecraft mc) {
         mc.execute(() -> {
-            if (mc.gui != null) {
-                mc.gui.setOverlayMessage(Component.literal(""), false);
-            }
+            if (mc.gui != null) mc.gui.setOverlayMessage(Component.literal(""), false);
         });
     }
 }
