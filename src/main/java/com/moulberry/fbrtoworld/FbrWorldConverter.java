@@ -657,6 +657,35 @@ public class FbrWorldConverter {
         gen.put("settings", genSettings);
         overworld.put("generator", gen);
         dimensions.put("minecraft:overworld", overworld);
+
+        // Nether — required for dimension teleportation to work
+        CompoundTag nether = new CompoundTag();
+        nether.putString("type", "minecraft:the_nether");
+        CompoundTag netherGen = new CompoundTag();
+        netherGen.putString("type", "minecraft:flat");
+        CompoundTag netherSettings = new CompoundTag();
+        netherSettings.put("layers", new ListTag());
+        netherSettings.putString("biome", "minecraft:nether_wastes");
+        netherSettings.putByte("features", (byte) 0);
+        netherSettings.putByte("lakes", (byte) 0);
+        netherGen.put("settings", netherSettings);
+        nether.put("generator", netherGen);
+        dimensions.put("minecraft:the_nether", nether);
+
+        // End — required for dimension teleportation to work
+        CompoundTag end = new CompoundTag();
+        end.putString("type", "minecraft:the_end");
+        CompoundTag endGen = new CompoundTag();
+        endGen.putString("type", "minecraft:flat");
+        CompoundTag endSettings = new CompoundTag();
+        endSettings.put("layers", new ListTag());
+        endSettings.putString("biome", "minecraft:the_end");
+        endSettings.putByte("features", (byte) 0);
+        endSettings.putByte("lakes", (byte) 0);
+        endGen.put("settings", endSettings);
+        end.put("generator", endGen);
+        dimensions.put("minecraft:the_end", end);
+
         worldGenSettings.put("dimensions", dimensions);
         data.put("WorldGenSettings", worldGenSettings);
 
