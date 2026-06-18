@@ -1,5 +1,6 @@
 package com.moulberry.fbrtoworld;
 
+import java.util.concurrent.CancellationException;
 import io.netty.buffer.Unpooled;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.Holder;
@@ -33,30 +34,95 @@ public class FbrWorldConverter {
     private static final String VERSION_NAME = net.minecraft.SharedConstants.getCurrentVersion().name();
 
     public static volatile boolean running = false;
+    public static volatile boolean cancelRequested = false;
+    private static volatile Thread currentThread = null;
+
+    // Progress fields polled by FbrConvertProgressScreen
+    public static volatile String progressPhase = "";
+    public static volatile int progressCurrent = 0;
+    public static volatile int progressTotal = 0;
+    public static volatile String progressWorldName = "";
+    public static volatile boolean progressDone = false;
+    public static volatile String progressResultMessage = "";
+    public static volatile boolean progressFailed = false;
+
+    /** Requests cancellation of the in-progress conversion, checked between chunks/files. */
+    public static void cancel() {
+        FbrToWorldMod.LOGGER.info("[FbrToWorld] Cancel requested by user");
+        cancelRequested = true;
+        Thread t = currentThread;
+        if (t != null) t.interrupt();
+    }
 
     public static boolean start(Path fbrPath, RegistryAccess registryAccess, Minecraft mc) {
-        if (running) return false;
+        FbrToWorldMod.LOGGER.info("[FbrToWorld] start() called — path={}, alreadyRunning={}", fbrPath, running);
+        if (running) {
+            FbrToWorldMod.LOGGER.warn("[FbrToWorld] start() aborted — a conversion is already running");
+            return false;
+        }
         running = true;
+        cancelRequested = false;
+        progressPhase = "Starting...";
+        progressCurrent = 0;
+        progressTotal = 0;
+        progressWorldName = "";
+        progressDone = false;
+        progressResultMessage = "";
+        progressFailed = false;
         Thread t = new Thread(() -> {
             try {
+                FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion thread started for {}", fbrPath);
                 convert(fbrPath, registryAccess, mc);
-            } catch (Exception e) {
-                FbrToWorldMod.LOGGER.error("[FbrToWorld] Conversion failed", e);
+                FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion thread completed normally for {}", fbrPath);
+            } catch (CancellationException e) {
+                FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion cancelled by user");
                 clearActionBar(mc);
-                sendMessage(mc, "§c[FbrToWorld] Failed: " + e.getMessage() + " — see log.");
+                sendMessage(mc, "§e[FbrToWorld] Conversion cancelled.");
+                progressResultMessage = "Cancelled.";
+                progressDone = true;
+            } catch (Exception e) {
+                if (cancelRequested) {
+                    // Interruption can surface as other exception types (IOException,
+                    // InterruptedException, etc) depending on where it was caught —
+                    // treat any exception during a requested cancel as a cancellation.
+                    FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion stopped due to cancellation");
+                    clearActionBar(mc);
+                    sendMessage(mc, "§e[FbrToWorld] Conversion cancelled.");
+                    progressResultMessage = "Cancelled.";
+                    progressDone = true;
+                } else {
+                    FbrToWorldMod.LOGGER.error("[FbrToWorld] Conversion failed", e);
+                    clearActionBar(mc);
+                    sendMessage(mc, "§c[FbrToWorld] Failed: " + e.getMessage() + " — see log.");
+                    progressFailed = true;
+                    progressResultMessage = "Failed: " + e.getMessage();
+                    progressDone = true;
+                }
             } finally {
                 running = false;
+                currentThread = null;
             }
         }, "fbr-to-world");
         t.setDaemon(true);
+        currentThread = t;
         t.start();
+        FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion thread launched, start() returning true");
         return true;
+    }
+
+    /** Throws if cancellation was requested — call between chunks/files in long loops. */
+    private static void checkCancelled() {
+        if (cancelRequested || Thread.currentThread().isInterrupted()) {
+            throw new CancellationException("Conversion cancelled");
+        }
     }
 
     // ── Main conversion ───────────────────────────────────────────────────────
 
     private static void convert(Path fbrPath, RegistryAccess registryAccess, Minecraft mc) throws Exception {
+        FbrToWorldMod.LOGGER.info("[FbrToWorld] convert() — checking file exists: {}", fbrPath);
         if (!Files.exists(fbrPath)) {
+            FbrToWorldMod.LOGGER.error("[FbrToWorld] File not found: {}", fbrPath);
             sendMessage(mc, "§c[FbrToWorld] File not found: " + fbrPath);
             return;
         }
@@ -102,6 +168,7 @@ public class FbrWorldConverter {
             byte[] headBuf = new byte[16];
 
             for (int cfi = 0; cfi < totalCacheFiles; cfi++) {
+                checkCancelled();
                 setActionBar(mc, "Indexing cache", cfi + 1, totalCacheFiles);
                 try (InputStream is = Files.newInputStream(cacheFiles.get(cfi))) {
                     while (true) {
@@ -144,6 +211,7 @@ public class FbrWorldConverter {
             final int MAGIC = 0xD780E884;
 
             for (int fbi = 0; fbi < totalFbFiles; fbi++) {
+                checkCancelled();
                 setActionBar(mc, "Scanning timeline", fbi + 1, totalFbFiles);
                 byte[] fbBytes = Files.readAllBytes(flashbackFiles.get(fbi));
                 FriendlyByteBuf fbuf = new FriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(fbBytes));
@@ -203,6 +271,7 @@ public class FbrWorldConverter {
                 worldPath = savesDir.resolve(baseName + "_" + i);
             }
             Files.createDirectories(worldPath);
+            progressWorldName = worldPath.getFileName().toString();
             writeLevelDat(worldPath, baseName);
 
             var biomeRegistry = registryAccess.lookupOrThrow(Registries.BIOME);
@@ -254,6 +323,7 @@ public class FbrWorldConverter {
                         }
 
                         if (written % 16 == 0) {
+                            checkCancelled();
                             String shortDim = dim.contains(":") ? dim.split(":")[1] : dim;
                             setActionBar(mc, "Writing " + shortDim, written, totalChunks);
                         }
@@ -300,10 +370,16 @@ public class FbrWorldConverter {
             for (var m : entityWriters.values()) for (var w : m.values()) w.close();
 
             clearActionBar(mc);
-            sendMessage(mc, "§a[FbrToWorld] Done! " + written + " chunks written"
+            String resultMsg = written + " chunks written"
                     + (skipped > 0 ? " (" + skipped + " skipped)" : "")
                     + " across " + dimPosToWinnerIndex.size() + " dimension(s)"
-                    + " → saves/" + worldPath.getFileName());
+                    + " → saves/" + worldPath.getFileName();
+            sendMessage(mc, "§a[FbrToWorld] Done! " + resultMsg);
+            progressPhase = "Done";
+            progressCurrent = written;
+            progressTotal = totalChunks;
+            progressResultMessage = resultMsg;
+            progressDone = true;
         }
     }
 
@@ -559,64 +635,18 @@ public class FbrWorldConverter {
         data.put("Version", version);
 
         CompoundTag gameRules = new CompoundTag();
-        gameRules.putByte("minecraft:advance_time", (byte) 0);
-        gameRules.putByte("minecraft:advance_weather", (byte) 0);
-        gameRules.putByte("minecraft:allow_entering_nether_using_portals", (byte) 1);
-        gameRules.putByte("minecraft:block_drops", (byte) 1);
-        gameRules.putByte("minecraft:block_explosion_drop_decay", (byte) 1);
-        gameRules.putByte("minecraft:command_block_output", (byte) 1);
-        gameRules.putByte("minecraft:command_blocks_work", (byte) 1);
-        gameRules.putByte("minecraft:drowning_damage", (byte) 1);
-        gameRules.putByte("minecraft:elytra_movement_check", (byte) 1);
-        gameRules.putByte("minecraft:ender_pearls_vanish_on_death", (byte) 1);
-        gameRules.putByte("minecraft:entity_drops", (byte) 1);
-        gameRules.putByte("minecraft:fall_damage", (byte) 1);
-        gameRules.putByte("minecraft:fire_damage", (byte) 1);
-        gameRules.putInt("minecraft:fire_spread_radius_around_player", 128);
-        gameRules.putByte("minecraft:forgive_dead_players", (byte) 1);
-        gameRules.putByte("minecraft:freeze_damage", (byte) 1);
-        gameRules.putByte("minecraft:global_sound_events", (byte) 1);
-        gameRules.putByte("minecraft:immediate_respawn", (byte) 0);
-        gameRules.putByte("minecraft:keep_inventory", (byte) 0);
-        gameRules.putByte("minecraft:limited_crafting", (byte) 0);
-        gameRules.putByte("minecraft:lava_source_conversion", (byte) 0);
-        gameRules.putByte("minecraft:locator_bar", (byte) 1);
-        gameRules.putByte("minecraft:log_admin_commands", (byte) 1);
-        gameRules.putInt("minecraft:max_block_modifications", 32768);
-        gameRules.putInt("minecraft:max_command_forks", 65536);
-        gameRules.putInt("minecraft:max_command_sequence_length", 65536);
-        gameRules.putInt("minecraft:max_entity_cramming", 24);
-        gameRules.putInt("minecraft:max_snow_accumulation_height", 1);
-        gameRules.putByte("minecraft:mob_drops", (byte) 1);
-        gameRules.putByte("minecraft:mob_explosion_drop_decay", (byte) 1);
-        gameRules.putByte("minecraft:mob_griefing", (byte) 1);
-        gameRules.putByte("minecraft:natural_health_regeneration", (byte) 1);
-        gameRules.putByte("minecraft:player_movement_check", (byte) 1);
-        gameRules.putInt("minecraft:players_nether_portal_creative_delay", 0);
-        gameRules.putInt("minecraft:players_nether_portal_default_delay", 80);
-        gameRules.putInt("minecraft:players_sleeping_percentage", 100);
-        gameRules.putByte("minecraft:projectiles_can_break_blocks", (byte) 1);
-        gameRules.putByte("minecraft:pvp", (byte) 1);
-        gameRules.putByte("minecraft:raids", (byte) 1);
-        gameRules.putInt("minecraft:random_tick_speed", 3);
-        gameRules.putByte("minecraft:reduced_debug_info", (byte) 0);
-        gameRules.putInt("minecraft:respawn_radius", 10);
-        gameRules.putByte("minecraft:send_command_feedback", (byte) 1);
-        gameRules.putByte("minecraft:show_advancement_messages", (byte) 1);
-        gameRules.putByte("minecraft:show_death_messages", (byte) 1);
-        gameRules.putByte("minecraft:spawn_mobs", (byte) 0);
-        gameRules.putByte("minecraft:spawn_monsters", (byte) 0);
-        gameRules.putByte("minecraft:spawn_patrols", (byte) 0);
-        gameRules.putByte("minecraft:spawn_phantoms", (byte) 0);
-        gameRules.putByte("minecraft:spawn_wandering_traders", (byte) 0);
-        gameRules.putByte("minecraft:spawn_wardens", (byte) 0);
-        gameRules.putByte("minecraft:spawner_blocks_work", (byte) 1);
-        gameRules.putByte("minecraft:spectators_generate_chunks", (byte) 1);
-        gameRules.putByte("minecraft:spread_vines", (byte) 1);
-        gameRules.putByte("minecraft:tnt_explodes", (byte) 1);
-        gameRules.putByte("minecraft:tnt_explosion_drop_decay", (byte) 0);
-        gameRules.putByte("minecraft:universal_anger", (byte) 0);
-        gameRules.putByte("minecraft:water_source_conversion", (byte) 1);
+        for (var entry : com.moulberry.fbrtoworld.config.FbrGameRuleConfig.load().entrySet()) {
+            String value = entry.getValue();
+            if (value.equals("true") || value.equals("false")) {
+                gameRules.putByte(entry.getKey(), (byte) (value.equals("true") ? 1 : 0));
+            } else {
+                try {
+                    gameRules.putInt(entry.getKey(), Integer.parseInt(value));
+                } catch (NumberFormatException e) {
+                    gameRules.putByte(entry.getKey(), (byte) 1); // fallback, shouldn't happen
+                }
+            }
+        }
         data.put("game_rules", gameRules);
 
         CompoundTag dataPacks = new CompoundTag();
@@ -706,6 +736,10 @@ public class FbrWorldConverter {
 
     private static void setActionBar(Minecraft mc, String stage, int done, int total) {
         int clamped = Math.min(done, total);
+        progressPhase = stage;
+        progressCurrent = clamped;
+        progressTotal = total;
+
         int pct     = total > 0 ? (clamped * 100 / total) : 0;
         int filled  = pct / 5;
         String bar  = "█".repeat(filled) + "░".repeat(20 - filled);

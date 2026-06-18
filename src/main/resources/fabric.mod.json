@@ -1,9 +1,9 @@
 {
   "schemaVersion": 1,
   "id": "fbr-to-world",
-  "version": "1.4.0",
+  "version": "${version}",
   "name": "FBR to World",
-  "description": "Converts a Flashback .fbr recording file into a playable singleplayer world by reading every chunk from the recording's cache. Use /fbrtoworld <path/to/recording.fbr>",
+  "description": "Converts a Flashback .zip recording file into a playable singleplayer world by reading every chunk from the recording's cache.",
   "authors": ["peli_G"],
   "contact": {
     "homepage": "https://github.com/peli-G/Flashback-Recording-To-World",
@@ -12,7 +12,7 @@
 
   },
   "license": "MIT",
-  "icon": "assets/fbr/icon.png",
+  "icon": "assets/fbr-to-world/icon.png",
   "environment": "client",
   "entrypoints": {
     "client": [
@@ -27,5 +27,8 @@
     "minecraft": ">=1.21.11 <1.21.12",
     "java": ">=21",
     "fabric-api": "*"
+  },
+  "recommends": {
+    "flashback": "*"
   }
 }

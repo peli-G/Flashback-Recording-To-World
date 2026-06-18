@@ -3,8 +3,17 @@ plugins {
     id 'java'
 }
 
-version = project.mod_version
+version = "${project.mod_version}+${project.minecraft_version}"
 group   = project.maven_group
+
+processResources {
+    inputs.property "version", project.version
+    filteringCharset = "UTF-8"
+
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
 
 base {
     archivesName = project.archives_base_name
@@ -20,7 +29,9 @@ dependencies {
     mappings     loom.officialMojangMappings()
     modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
-    // No Flashback dependency — we read the .fbr zip format directly
+    // Fully standalone — no Flashback dependency, even compile-only. Flashback's
+    // button (if installed alongside) is detected purely via reflection at runtime
+    // in MixinTitleScreen, for position-avoidance only.
 }
 
 java {

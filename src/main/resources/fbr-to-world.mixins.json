@@ -3,7 +3,8 @@
   "package": "com.moulberry.fbrtoworld.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
-    "ClientboundLevelChunkPacketDataAccessor"
+    "ClientboundLevelChunkPacketDataAccessor",
+    "ui.MixinTitleScreen"
   ],
   "injectors": {
     "defaultRequire": 1
