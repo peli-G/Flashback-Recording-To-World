@@ -6,10 +6,6 @@ import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 
-/**
- * Conversion progress screen, visually modelled after vanilla's "Optimizing World"
- * screen (title, stage label, progress bar with percentage, Cancel/Close button).
- */
 public class FbrConvertProgressScreen extends Screen {
 
     private final Screen parent;
@@ -62,7 +58,6 @@ public class FbrConvertProgressScreen extends Screen {
 
         guiGraphics.drawCenteredString(this.font, phaseLabel, this.width / 2, 50, phaseColor);
 
-        // Progress bar
         int barWidth = 200;
         int barX = this.width / 2 - barWidth / 2;
         int barY = this.height / 4 + 100;

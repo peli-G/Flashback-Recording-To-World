@@ -14,22 +14,16 @@ public class FbrToWorldMod implements ClientModInitializer {
     public static final String MOD_ID = "fbr-to-world";
     public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
-    /** .minecraft/flashback/replays/ — mirrors Flashback's getReplayFolder() */
     public static Path getFlashbackReplaysFolder() {
         return FabricLoader.getInstance().getGameDir()
                 .resolve("flashback")
                 .resolve("replays");
     }
 
-    /** Default folder shown when FbrSelectReplayScreen is opened from the title screen. */
     public static Path getDefaultReplaysFolder() {
         return getFlashbackReplaysFolder();
     }
 
-    /**
-     * Recursively list all recordings (zip/fbr files) under root,
-     * returning paths relative to root so they look like "subfolder/name.zip".
-     */
     public static List<String> listRecordings(Path root, Path dir) throws IOException {
         List<String> results = new ArrayList<>();
         try (DirectoryStream<Path> ds = Files.newDirectoryStream(dir)) {
@@ -48,17 +42,12 @@ public class FbrToWorldMod implements ClientModInitializer {
         return results;
     }
 
-    /**
-     * Search replaysRoot and all subdirectories for a file matching the given name.
-     * Supports exact match or partial/extensionless match.
-     */
     public static Path findRecording(Path replaysRoot, String name) {
         try {
-            // First try direct match in root
+
             Path direct = replaysRoot.resolve(name);
             if (Files.exists(direct) && !Files.isDirectory(direct)) return direct;
 
-            // Walk all files recursively
             final String nameLower = name.toLowerCase();
             final String nameNoExt = nameLower.contains(".")
                     ? nameLower.substring(0, nameLower.lastIndexOf('.')) : nameLower;
@@ -69,7 +58,7 @@ public class FbrToWorldMod implements ClientModInitializer {
                     .filter(p -> {
                         String fn = p.getFileName().toString().toLowerCase();
                         String fnNoExt = fn.contains(".") ? fn.substring(0, fn.lastIndexOf('.')) : fn;
-                        // Match: exact filename, relative path, or basename without extension
+
                         return fn.equals(nameLower)
                                 || fnNoExt.equals(nameNoExt)
                                 || replaysRoot.relativize(p).toString().replace("\\", "/").equalsIgnoreCase(name);
@@ -81,19 +70,11 @@ public class FbrToWorldMod implements ClientModInitializer {
         }
     }
 
-    /**
-     * Caches the RegistryAccess from the most recently active world/connection,
-     * so the replay browser can still convert replays from the title screen
-     * after quitting a world (Minecraft tears down mc.level/mc.getConnection()
-     * on disconnect, but the registry contents themselves don't actually change
-     * between vanilla worlds/servers in the common case).
-     */
     public static volatile net.minecraft.core.RegistryAccess cachedRegistryAccess = null;
 
     @Override
     public void onInitializeClient() {
 
-        // Ensure .minecraft/flashback/replays/ exists on startup
         try {
             Files.createDirectories(getFlashbackReplaysFolder());
         } catch (IOException e) {

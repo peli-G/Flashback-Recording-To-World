@@ -12,13 +12,6 @@ import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/**
- * Persists the gamerule defaults FBR writes into every converted world's level.dat.
- * Stored as a simple "rule name -> NBT-style value string" map in a JSON file under
- * .minecraft/config/, completely independent of any particular world's actual
- * GameRules instance (since conversion can happen before any world with these exact
- * settings exists).
- */
 public class FbrGameRuleConfig {
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
@@ -27,11 +20,6 @@ public class FbrGameRuleConfig {
         return FabricLoader.getInstance().getConfigDir().resolve("fbr-to-world-gamerules.json");
     }
 
-    /**
-     * The mod's built-in defaults — these are what "Reset" restores, and what gets
-     * used the very first time (before the user has ever customized anything).
-     * Mirrors the same defaults already hardcoded in FbrWorldConverter#writeLevelDat.
-     */
     public static Map<String, String> builtInDefaults() {
         Map<String, String> m = new LinkedHashMap<>();
         m.put("minecraft:advance_time", "false");
@@ -95,7 +83,6 @@ public class FbrGameRuleConfig {
         return m;
     }
 
-    /** Loads the user's saved gamerule defaults, falling back to built-in defaults for anything missing. */
     public static Map<String, String> load() {
         Map<String, String> result = new LinkedHashMap<>(builtInDefaults());
         Path path = configPath();

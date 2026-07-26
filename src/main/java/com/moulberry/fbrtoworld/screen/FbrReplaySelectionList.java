@@ -22,11 +22,6 @@ import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 
-/**
- * Standalone equivalent of Flashback's ReplaySelectionList — scans a folder
- * for .zip replay files (and subfolders), loads their metadata.json/icon.png
- * asynchronously, and renders them as a scrollable, sortable, searchable list.
- */
 public class FbrReplaySelectionList extends ObjectSelectionList<FbrReplaySelectionEntry> {
 
     private final FbrSelectReplayScreen screen;

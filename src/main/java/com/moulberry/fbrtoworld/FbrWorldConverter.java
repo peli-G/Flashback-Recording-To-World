@@ -37,7 +37,6 @@ public class FbrWorldConverter {
     public static volatile boolean cancelRequested = false;
     private static volatile Thread currentThread = null;
 
-    // Progress fields polled by FbrConvertProgressScreen
     public static volatile String progressPhase = "";
     public static volatile int progressCurrent = 0;
     public static volatile int progressTotal = 0;
@@ -46,7 +45,6 @@ public class FbrWorldConverter {
     public static volatile String progressResultMessage = "";
     public static volatile boolean progressFailed = false;
 
-    /** Requests cancellation of the in-progress conversion, checked between chunks/files. */
     public static void cancel() {
         FbrToWorldMod.LOGGER.info("[FbrToWorld] Cancel requested by user");
         cancelRequested = true;
@@ -82,9 +80,7 @@ public class FbrWorldConverter {
                 progressDone = true;
             } catch (Exception e) {
                 if (cancelRequested) {
-                    // Interruption can surface as other exception types (IOException,
-                    // InterruptedException, etc) depending on where it was caught —
-                    // treat any exception during a requested cancel as a cancellation.
+
                     FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion stopped due to cancellation");
                     clearActionBar(mc);
                     sendMessage(mc, "§e[FbrToWorld] Conversion cancelled.");
@@ -110,14 +106,11 @@ public class FbrWorldConverter {
         return true;
     }
 
-    /** Throws if cancellation was requested — call between chunks/files in long loops. */
     private static void checkCancelled() {
         if (cancelRequested || Thread.currentThread().isInterrupted()) {
             throw new CancellationException("Conversion cancelled");
         }
     }
-
-    // ── Main conversion ───────────────────────────────────────────────────────
 
     private static void convert(Path fbrPath, RegistryAccess registryAccess, Minecraft mc) throws Exception {
         FbrToWorldMod.LOGGER.info("[FbrToWorld] convert() — checking file exists: {}", fbrPath);
@@ -155,12 +148,6 @@ public class FbrWorldConverter {
                     .bind(RegistryFriendlyByteBuf.decorator(registryAccess))
                     .codec();
 
-            // ═══════════════════════════════════════════════════════════════
-            // PHASE 1 — Lightweight position index
-            // Read only the first ~16 bytes of each cache entry (VarInt ID +
-            // x int + z int). Skip the rest without allocating a buffer.
-            // Result: indexToXZ[globalIndex] = [x, z]
-            // ═══════════════════════════════════════════════════════════════
             sendMessage(mc, "§a[FbrToWorld] Phase 1/3: Indexing chunk positions...");
 
             Map<Integer, int[]> indexToXZ = new HashMap<>();
@@ -198,12 +185,6 @@ public class FbrWorldConverter {
             sendMessage(mc, "§a[FbrToWorld] Phase 1 done: " + indexToXZ.size()
                     + " of " + totalPackets + " entries indexed.");
 
-            // ═══════════════════════════════════════════════════════════════
-            // PHASE 2 — Timeline scan
-            // Walk .flashback files, track dimension via Login/Respawn packets,
-            // record which chunk index was last used per (dim, chunkPos).
-            // Last write wins — matches the original single-pass behaviour.
-            // ═══════════════════════════════════════════════════════════════
             sendMessage(mc, "§a[FbrToWorld] Phase 2/3: Scanning timeline...");
 
             Map<String, Map<Long, Integer>> dimPosToWinnerIndex = new LinkedHashMap<>();
@@ -231,7 +212,6 @@ public class FbrWorldConverter {
                     if ("flashback:action/level_chunk_cached".equals(actionNames.get(i)))   chunkCachedId = i;
                 }
 
-                // Snapshot section
                 int snapSize = fbuf.readInt();
                 byte[] snapBytes = new byte[snapSize];
                 fbuf.readBytes(snapBytes);
@@ -239,12 +219,10 @@ public class FbrWorldConverter {
                 scanActions(snapBuf, gamePacketId, chunkCachedId,
                         gamePacketCodec, registryAccess, indexToXZ, currentDim, dimPosToWinnerIndex);
 
-                // Main section
                 scanActions(fbuf, gamePacketId, chunkCachedId,
                         gamePacketCodec, registryAccess, indexToXZ, currentDim, dimPosToWinnerIndex);
             }
 
-            // Build reverse map: winner cache index → dim
             Map<Integer, String> winnerIndexToDim = new HashMap<>();
             for (var e : dimPosToWinnerIndex.entrySet())
                 for (int idx : e.getValue().values())
@@ -259,7 +237,6 @@ public class FbrWorldConverter {
                 return;
             }
 
-            // Create output world
             String baseName = fbrPath.getFileName().toString()
                     .replaceAll("\\.[^.]+$", "")
                     .replaceAll("[\\\\/:*?\"<>|]", "_");
@@ -293,12 +270,6 @@ public class FbrWorldConverter {
                 dimPaths.put(dimId, dp);
             }
 
-            // ═══════════════════════════════════════════════════════════════
-            // PHASE 3 — Streaming write
-            // Walk cache files a second time. Non-winners: skipFully() with
-            // zero allocation. Winners: readNBytes() → decode → write → discard.
-            // Peak heap: one decoded chunk at a time, regardless of file size.
-            // ═══════════════════════════════════════════════════════════════
             sendMessage(mc, "§a[FbrToWorld] Phase 3/3: Writing chunks...");
 
             Map<String, Map<Long, RegionFileWriter>> regionWriters = new HashMap<>();
@@ -383,8 +354,6 @@ public class FbrWorldConverter {
         }
     }
 
-    // ── Timeline scanner ──────────────────────────────────────────────────────
-
     private static void scanActions(
             FriendlyByteBuf buf,
             int gamePacketId,
@@ -434,8 +403,6 @@ public class FbrWorldConverter {
         }
     }
 
-    // ── Dimension path ────────────────────────────────────────────────────────
-
     private static Path resolveDimPath(Path worldPath, String dimId) {
         return switch (dimId) {
             case "minecraft:overworld"  -> worldPath;
@@ -447,8 +414,6 @@ public class FbrWorldConverter {
             }
         };
     }
-
-    // ── Byte utilities ────────────────────────────────────────────────────────
 
     private static int readInt4(byte[] b, int off) {
         return ((b[off] & 0xff) << 24) | ((b[off + 1] & 0xff) << 16)
@@ -474,8 +439,6 @@ public class FbrWorldConverter {
         }
     }
 
-    // ── Chunk NBT ─────────────────────────────────────────────────────────────
-
     @SuppressWarnings("unchecked")
     private static CompoundTag buildChunkNbt(
             ClientboundLevelChunkWithLightPacket packet,
@@ -493,9 +456,6 @@ public class FbrWorldConverter {
 
         var rfbb = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(rawBuffer), registryAccess);
 
-        // Section range depends on dimension's world height
-        // Overworld: Y -64 to 320  -> sections -4 to 19  (24 sections)
-        // Nether/End: Y 0 to 256   -> sections  0 to 15  (16 sections)
         int minSectionY;
         int sectionCount;
         if ("minecraft:the_nether".equals(dimension) || "minecraft:the_end".equals(dimension)) {
@@ -558,8 +518,6 @@ public class FbrWorldConverter {
             sections.add(sec);
         }
 
-        // Use the confirmed public API: getBlockEntitiesTagsConsumer(x, z) -> Consumer<BlockEntityTagOutput>
-        // BlockEntityTagOutput.accept(BlockPos, BlockEntityType<?>, CompoundTag)
         ListTag blockEntities = new ListTag();
         chunkData.getBlockEntitiesTagsConsumer(cx, cz).accept((blockPos, beType, nbt) -> {
             CompoundTag beTag = nbt != null ? nbt.copy() : new CompoundTag();
@@ -593,8 +551,6 @@ public class FbrWorldConverter {
         chunk.put("Entities", new ListTag());
         return chunk;
     }
-
-    // ── level.dat ─────────────────────────────────────────────────────────────
 
     private static void writeLevelDat(Path worldFolder, String worldName) throws IOException {
         CompoundTag data = new CompoundTag();
@@ -643,7 +599,7 @@ public class FbrWorldConverter {
                 try {
                     gameRules.putInt(entry.getKey(), Integer.parseInt(value));
                 } catch (NumberFormatException e) {
-                    gameRules.putByte(entry.getKey(), (byte) 1); // fallback, shouldn't happen
+                    gameRules.putByte(entry.getKey(), (byte) 1);
                 }
             }
         }
@@ -668,7 +624,6 @@ public class FbrWorldConverter {
         serverBrands.add(StringTag.valueOf("fabric"));
         data.put("ServerBrands", serverBrands);
 
-        // Flat generator with no layers — unvisited areas generate nothing
         CompoundTag worldGenSettings = new CompoundTag();
         worldGenSettings.putLong("seed", 0L);
         worldGenSettings.putByte("generate_features", (byte) 0);
@@ -687,7 +642,6 @@ public class FbrWorldConverter {
         overworld.put("generator", gen);
         dimensions.put("minecraft:overworld", overworld);
 
-        // Nether — required for dimension teleportation to work
         CompoundTag nether = new CompoundTag();
         nether.putString("type", "minecraft:the_nether");
         CompoundTag netherGen = new CompoundTag();
@@ -701,7 +655,6 @@ public class FbrWorldConverter {
         nether.put("generator", netherGen);
         dimensions.put("minecraft:the_nether", nether);
 
-        // End — required for dimension teleportation to work
         CompoundTag end = new CompoundTag();
         end.putString("type", "minecraft:the_end");
         CompoundTag endGen = new CompoundTag();
@@ -724,8 +677,6 @@ public class FbrWorldConverter {
         Files.write(worldFolder.resolve("session.lock"),
                 ByteBuffer.allocate(8).putLong(System.currentTimeMillis()).array());
     }
-
-    // ── Chat / HUD ────────────────────────────────────────────────────────────
 
     private static void sendMessage(Minecraft mc, String message) {
         FbrToWorldMod.LOGGER.info(message);

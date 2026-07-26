@@ -12,11 +12,6 @@ import org.jetbrains.annotations.Nullable;
 
 import java.nio.file.Path;
 
-/**
- * Standalone replay browser screen — equivalent to Flashback's SelectReplayScreen
- * but with zero dependency on Flashback being installed. Full UI: thumbnails,
- * search bar, sort dropdown + direction, folder navigation.
- */
 public class FbrSelectReplayScreen extends Screen {
 
     public final Screen lastScreen;

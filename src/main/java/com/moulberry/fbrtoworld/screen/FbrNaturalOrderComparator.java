@@ -2,10 +2,6 @@ package com.moulberry.fbrtoworld.screen;
 
 import java.util.Comparator;
 
-/**
- * Simple natural-order string comparator (numbers compared by value, not
- * lexicographically) — e.g. "replay 2" sorts before "replay 10".
- */
 public class FbrNaturalOrderComparator implements Comparator<String> {
     public static final FbrNaturalOrderComparator INSTANCE = new FbrNaturalOrderComparator();
 

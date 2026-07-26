@@ -14,13 +14,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.function.Consumer;
 
-/**
- * Wraps vanilla's EditGameRulesScreen to edit FBR's own persistent gamerule
- * defaults (used when writing every converted world's level.dat), rather than
- * a live world's actual rules. The Cancel button is replaced with a Reset
- * button that reopens the editor pre-filled with FBR's built-in defaults
- * instead of just discarding changes.
- */
 public class FbrGameRuleScreen extends EditGameRulesScreen {
 
     private final Screen fbr$parentScreen;

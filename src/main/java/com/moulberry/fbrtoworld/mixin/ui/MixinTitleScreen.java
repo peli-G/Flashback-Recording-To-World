@@ -18,20 +18,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * Adds an FBR-to-World button to the title screen, positioned next to Flashback's
- * "open replays" button (a FlashbackButton instance) if Flashback is installed.
- * If Flashback is NOT installed, this mixin takes over Flashback's role entirely —
- * placing the FBR button where Flashback's button would have gone, using the same
- * overlap-avoidance placement algorithm Flashback itself uses.
- *
- * Uses only the public children() method to inspect existing widgets — no @Shadow
- * on private fields — so this mixin works correctly even without a refmap.
- *
- * Priority is higher than Flashback's own MixinTitleScreen (1300), so ours runs
- * after it on each tick check, meaning Flashback's button (if present) already
- * exists in the widget list by the time we look for it.
- */
 @Mixin(value = TitleScreen.class, priority = 1400)
 public abstract class MixinTitleScreen extends Screen {
 
@@ -70,9 +56,6 @@ public abstract class MixinTitleScreen extends Screen {
         this.fbr$checkedPosition = false;
     }
 
-    // Run on tick (after Flashback's own tick-based repositioning, since our mixin
-    // priority is higher) so our button is placed only after Flashback's button
-    // (if present) has settled into its final position for this frame.
     @Inject(method = "tick", at = @At("RETURN"))
     private void fbr$onTick(CallbackInfo ci) {
         if (!this.fbr$checkedPosition) {
@@ -109,7 +92,6 @@ public abstract class MixinTitleScreen extends Screen {
             return;
         }
 
-        // If the button already exists and doesn't overlap anything, leave it alone
         if (this.fbr$button != null && !fbr$wouldOverlap(
                 this.fbr$button.getX(), this.fbr$button.getY(),
                 this.fbr$button.getWidth(), this.fbr$button.getHeight())) {
@@ -119,8 +101,7 @@ public abstract class MixinTitleScreen extends Screen {
         AbstractWidget flashbackButton = this.fbr$findFlashbackButton();
 
         if (flashbackButton != null) {
-            // Place immediately to the right of Flashback's button, shifting further
-            // right in increments if that overlaps something else.
+
             int size = flashbackButton.getHeight();
             for (int offsetX = 0; offsetX < 5; offsetX++) {
                 int x = flashbackButton.getRight() + 4 + size * offsetX;
@@ -132,9 +113,6 @@ public abstract class MixinTitleScreen extends Screen {
             }
         }
 
-        // Fallback: Flashback isn't installed (or no space found next to it) —
-        // take over Flashback's own role: place next to the last normal menu widget,
-        // using the same overlap-avoidance algorithm Flashback itself uses.
         for (int offsetX = 0; offsetX < 5; offsetX++) {
             for (int i = this.fbr$normalMenuWidgets.size() - 1; i >= 0; i--) {
                 AbstractWidget widget = this.fbr$normalMenuWidgets.get(i);
@@ -175,9 +153,7 @@ public abstract class MixinTitleScreen extends Screen {
                 + "(connection={}, level={}, cachedRegistry={})",
                 this.minecraft.getConnection() != null, this.minecraft.level != null,
                 com.moulberry.fbrtoworld.FbrToWorldMod.cachedRegistryAccess != null);
-        // Always open our own standalone replay browser — Flashback's button (if
-        // present) opens Flashback's own SelectReplayScreen independently. We only
-        // ever read Flashback's button for *positioning* (above), never its screen.
+
         this.minecraft.setScreen(new com.moulberry.fbrtoworld.screen.FbrSelectReplayScreen(this));
     }
 
@@ -195,9 +171,6 @@ public abstract class MixinTitleScreen extends Screen {
         return false;
     }
 
-    // Mirror Flashback's own tracking of "normal menu" widgets (Singleplayer, Multiplayer,
-    // Realms, Options, Quit) so our fallback positioning (when Flashback isn't installed)
-    // has the same anchor points to work with.
     @WrapOperation(method = "createNormalMenuOptions", at = @At(value = "INVOKE",
             target = "Lnet/minecraft/client/gui/screens/TitleScreen;addRenderableWidget(Lnet/minecraft/client/gui/components/events/GuiEventListener;)Lnet/minecraft/client/gui/components/events/GuiEventListener;"))
     private GuiEventListener fbr$trackNormalMenuOption(TitleScreen instance, GuiEventListener listener, Operation<GuiEventListener> original) {

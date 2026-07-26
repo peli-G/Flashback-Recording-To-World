@@ -7,11 +7,6 @@ import net.minecraft.client.renderer.RenderPipelines;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
 
-/**
- * A 16x16 pixelated-icon title-screen button, styled the same way as Flashback's
- * own FlashbackButton. Place the icon at:
- * src/main/resources/assets/fbr-to-world/icon_pixelated.png (16x16)
- */
 public class FbrIconButton extends Button {
 
     private final Identifier icon;

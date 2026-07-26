@@ -6,10 +6,6 @@ import org.jetbrains.annotations.Nullable;
 
 import java.nio.file.Path;
 
-/**
- * Standalone equivalent of Flashback's ReplaySummary — holds metadata about a
- * single .fbr/.zip replay file for display in FbrSelectReplayScreen.
- */
 public class FbrReplaySummary {
     private final Path path;
     private final FbrMeta metadata;
@@ -30,9 +26,6 @@ public class FbrReplaySummary {
         this.filesize = filesize;
         this.iconBytes = iconBytes;
 
-        // FBR converts the .fbr file directly rather than replaying packets, so a
-        // protocol/data version mismatch is just a heads-up, not a hard blocker —
-        // the converter reads NBT/registry IDs directly and is fairly tolerant.
         if (metadata.dataVersion != 0
                 && metadata.dataVersion != SharedConstants.getCurrentVersion().dataVersion().version()) {
             this.hasWarning = true;

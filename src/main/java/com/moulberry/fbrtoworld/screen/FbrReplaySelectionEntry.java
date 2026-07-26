@@ -26,11 +26,6 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.time.format.FormatStyle;
 
-/**
- * Standalone equivalent of Flashback's ReplaySelectionEntry — renders one row
- * in the replay browser list: thumbnail/folder icon, name, date, info, and a
- * join/error/warning overlay on hover.
- */
 public abstract class FbrReplaySelectionEntry extends ObjectSelectionList.Entry<FbrReplaySelectionEntry> implements AutoCloseable {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("fbr-to-world");
@@ -221,9 +216,7 @@ public abstract class FbrReplaySelectionEntry extends ObjectSelectionList.Entry<
                     "[FbrToWorld] Using registry access source: {}", source);
 
             if (registryAccess == null) {
-                // Conversion needs registries (biomes, block entity types, etc) from
-                // a world — these aren't available before joining any world for the
-                // very first time this game session.
+
                 this.minecraft.setScreen(new net.minecraft.client.gui.screens.AlertScreen(
                         () -> this.minecraft.setScreen(this.list.getScreen()),
                         net.minecraft.network.chat.Component.literal("Can't Convert Yet"),

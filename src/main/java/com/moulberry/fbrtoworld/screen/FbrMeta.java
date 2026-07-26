@@ -3,11 +3,6 @@ package com.moulberry.fbrtoworld.screen;
 import com.google.gson.JsonObject;
 import org.jetbrains.annotations.Nullable;
 
-/**
- * Standalone parser for Flashback's metadata.json format (read-only subset —
- * only the fields our replay browser actually displays). Independent of any
- * Flashback classes so this mod works even when Flashback isn't installed.
- */
 public class FbrMeta {
     public String name = "Unnamed";
     public String worldName = null;
@@ -29,7 +24,7 @@ public class FbrMeta {
         if (meta.has("protocol_version")) result.protocolVersion = meta.get("protocol_version").getAsInt();
         if (meta.has("version_string")) result.versionString = meta.get("version_string").getAsString();
 
-        if (!meta.has("chunks")) return null; // not a valid Flashback recording
+        if (!meta.has("chunks")) return null;
 
         return result;
     }

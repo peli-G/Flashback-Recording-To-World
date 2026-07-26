@@ -9,10 +9,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.zip.DeflaterOutputStream;
 
-/**
- * Minimal Anvil region file writer.
- * Accumulates all chunks in memory, then flushes everything in one write on close().
- */
 public class RegionFileWriter implements Closeable {
 
     private static final int SECTOR_SIZE = 4096;
@@ -36,14 +32,14 @@ public class RegionFileWriter implements Closeable {
         }
 
         byte[] compressed = baos.toByteArray();
-        // 5-byte entry header: 4 bytes length (includes the compression-type byte) + 1 byte type
+
         int entryLen = 1 + compressed.length;
         byte[] entry = new byte[5 + compressed.length];
         entry[0] = (byte)((entryLen >> 24) & 0xFF);
         entry[1] = (byte)((entryLen >> 16) & 0xFF);
         entry[2] = (byte)((entryLen >>  8) & 0xFF);
         entry[3] = (byte)( entryLen        & 0xFF);
-        entry[4] = 2; // zlib
+        entry[4] = 2;
         System.arraycopy(compressed, 0, entry, 5, compressed.length);
 
         chunkData[index] = entry;
@@ -52,7 +48,7 @@ public class RegionFileWriter implements Closeable {
 
     @Override
     public void close() throws IOException {
-        // Build offset table: each entry is (sectorOffset << 8) | sectorCount
+
         int currentSector = HEADER_SECTORS;
         for (int i = 0; i < 1024; i++) {
             if (chunkData[i] == null) { offsets[i] = 0; continue; }
@@ -68,7 +64,7 @@ public class RegionFileWriter implements Closeable {
             for (int i = 0; i < 1024; i++) {
                 if (chunkData[i] == null) continue;
                 raf.write(chunkData[i]);
-                // Pad to sector boundary
+
                 int pad = SECTOR_SIZE - (chunkData[i].length % SECTOR_SIZE);
                 if (pad < SECTOR_SIZE) raf.write(new byte[pad]);
             }
