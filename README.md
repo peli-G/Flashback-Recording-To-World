@@ -8,7 +8,7 @@ The Mod Converts:
  - Entities
  - Biomes
 
-Download on [Github](https://github.com/peli-G/Flashback-Recording-To-World).
+Download on [Github](https://github.com/peli-G/Flashback-Recording-To-World) & [Modrinth](https:/modrinth.com/mod/fbr-to-world).
 
 # Gamerule Config
 Press the Gamerule Options to configure your default gamerules for the converted world.
