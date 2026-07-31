@@ -216,15 +216,9 @@ public abstract class FbrReplaySelectionEntry extends ObjectSelectionList.Entry<
                     "[FbrToWorld] Using registry access source: {}", source);
 
             if (registryAccess == null) {
-
-                this.minecraft.setScreen(new net.minecraft.client.gui.screens.AlertScreen(
-                        () -> this.minecraft.setScreen(this.list.getScreen()),
-                        net.minecraft.network.chat.Component.literal("Can't Convert Yet"),
-                        net.minecraft.network.chat.Component.literal(
-                                "Please join any world first (singleplayer or a server) at least once this session, then come back here to convert this replay."),
-                        net.minecraft.network.chat.Component.literal("Ok"),
-                        true
-                ));
+                com.moulberry.fbrtoworld.FbrToWorldMod.LOGGER.info(
+                        "[FbrToWorld] No live/cached registries — loading vanilla registries in the background");
+                this.startConversionAfterLoadingRegistries();
                 return;
             }
 
@@ -235,6 +229,41 @@ public abstract class FbrReplaySelectionEntry extends ObjectSelectionList.Entry<
             if (started) {
                 this.minecraft.setScreen(new FbrConvertProgressScreen(this.list.getScreen()));
             }
+        }
+
+        private void startConversionAfterLoadingRegistries() {
+            net.minecraft.client.gui.screens.Screen previousScreen = this.list.getScreen();
+            this.minecraft.setScreen(new net.minecraft.client.gui.screens.GenericMessageScreen(
+                    net.minecraft.network.chat.Component.literal("Loading registries...")));
+
+            com.moulberry.fbrtoworld.FbrRegistryLoader.loadVanillaRegistries().thenAccept(registryAccess -> {
+                this.minecraft.execute(() -> {
+                    com.moulberry.fbrtoworld.FbrToWorldMod.LOGGER.info(
+                            "[FbrToWorld] Vanilla registries loaded, starting conversion");
+                    boolean started = com.moulberry.fbrtoworld.FbrWorldConverter.start(
+                            this.summary.getPath(), registryAccess, this.minecraft);
+                    if (started) {
+                        this.minecraft.setScreen(new FbrConvertProgressScreen(previousScreen));
+                    } else {
+                        this.minecraft.setScreen(previousScreen);
+                    }
+                });
+            }).exceptionally(throwable -> {
+                this.minecraft.execute(() -> {
+                    com.moulberry.fbrtoworld.FbrToWorldMod.LOGGER.error(
+                            "[FbrToWorld] Failed to load vanilla registries", throwable);
+                    this.minecraft.setScreen(new net.minecraft.client.gui.screens.AlertScreen(
+                            () -> this.minecraft.setScreen(previousScreen),
+                            net.minecraft.network.chat.Component.literal("Couldn't Load Registries"),
+                            net.minecraft.network.chat.Component.literal(
+                                    "Failed to load vanilla registries: " + throwable.getMessage()
+                                            + " — try joining any world once this session instead."),
+                            net.minecraft.network.chat.Component.literal("Ok"),
+                            true
+                    ));
+                });
+                return null;
+            });
         }
 
         public void deleteReplay() {
