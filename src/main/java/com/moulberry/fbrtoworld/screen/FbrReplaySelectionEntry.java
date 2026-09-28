@@ -110,7 +110,8 @@ public abstract class FbrReplaySelectionEntry extends ObjectSelectionList.Entry<
             this.list.setSelected(this);
             if (event.x() - (double) this.list.getRowLeft() <= 32.0 || Util.getMillis() - this.lastClickTime < 250L) {
                 this.minecraft.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.UI_BUTTON_CLICK, 1.0f));
-                this.minecraft.setScreen(new FbrSelectReplayScreen(this.list.getScreen().lastScreen, this.path));
+                this.minecraft.setScreen(new FbrSelectReplayScreen(
+                        this.list.getScreen().lastScreen, this.path, this.list.isCombineMode()));
                 return true;
             }
             this.lastClickTime = Util.getMillis();
@@ -120,6 +121,7 @@ public abstract class FbrReplaySelectionEntry extends ObjectSelectionList.Entry<
 
     public static class ReplayListEntry extends FbrReplaySelectionEntry {
         private static final int ICON = 32;
+        private static final int BOX_SIZE = 14;
         private final Minecraft minecraft;
         private final FbrReplaySelectionList list;
         public final FbrReplaySummary summary;
@@ -173,97 +175,70 @@ public abstract class FbrReplaySelectionEntry extends ObjectSelectionList.Entry<
                         : (hoveredIcon ? JOIN_HIGHLIGHTED_SPRITE : JOIN_SPRITE);
                 guiGraphics.blitSprite(RenderPipelines.GUI_TEXTURED, overlay, x, y, ICON, ICON);
             }
+
+            if (this.list.isCombineMode()) {
+                this.renderCombineBox(guiGraphics, mouseX, mouseY, y);
+            }
+        }
+
+        private void renderCombineBox(GuiGraphics guiGraphics, int mouseX, int mouseY, int y) {
+            int bx = this.boxLeft();
+            int by = y + (ICON - BOX_SIZE) / 2;
+            int order = this.list.getCombineOrder(this.summary.getPath());
+            boolean hoveredBox = mouseX >= bx - 2 && mouseX <= bx + BOX_SIZE + 2
+                    && mouseY >= by - 2 && mouseY <= by + BOX_SIZE + 2;
+
+            guiGraphics.fill(bx - 3, by - 3, bx + BOX_SIZE + 3, by + BOX_SIZE + 3, 0xC0000000);
+
+            int border = order > 0 ? 0xFF55FF55 : (hoveredBox ? 0xFFFFFFFF : 0xFF909090);
+            guiGraphics.fill(bx, by, bx + BOX_SIZE, by + 1, border);
+            guiGraphics.fill(bx, by + BOX_SIZE - 1, bx + BOX_SIZE, by + BOX_SIZE, border);
+            guiGraphics.fill(bx, by, bx + 1, by + BOX_SIZE, border);
+            guiGraphics.fill(bx + BOX_SIZE - 1, by, bx + BOX_SIZE, by + BOX_SIZE, border);
+            guiGraphics.fill(bx + 1, by + 1, bx + BOX_SIZE - 1, by + BOX_SIZE - 1, 0xFF101010);
+
+            if (order > 0) {
+                String label = String.valueOf(order);
+                int tx = bx + (BOX_SIZE - this.minecraft.font.width(label)) / 2;
+                int ty = by + (BOX_SIZE - this.minecraft.font.lineHeight) / 2 + 1;
+                guiGraphics.drawString(this.minecraft.font, label, tx, ty, 0xFF55FF55, false);
+            }
+        }
+
+        private int boxLeft() {
+            return this.getContentX() - FbrReplaySelectionList.CHECKBOX_GUTTER + 3;
+        }
+
+        private boolean isOverCombineBox(double mouseX, double mouseY) {
+            int bx = this.boxLeft();
+            int by = this.getContentY() + (ICON - BOX_SIZE) / 2;
+            return mouseX >= bx - 3 && mouseX <= bx + BOX_SIZE + 3
+                    && mouseY >= by - 3 && mouseY <= by + BOX_SIZE + 3;
         }
 
         @Override
         public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
             this.list.setSelected(this);
+
+            if (this.list.isCombineMode()) {
+                if (this.isOverCombineBox(event.x(), event.y())) {
+                    this.minecraft.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.UI_BUTTON_CLICK, 1.0f));
+                    this.list.toggleCombine(this.summary.getPath());
+                    this.list.setSelected(this);
+                    this.lastClickTime = Util.getMillis();
+                    return true;
+                }
+                this.lastClickTime = Util.getMillis();
+                return super.mouseClicked(event, doubleClick);
+            }
+
             if (event.x() - (double) this.list.getRowLeft() <= 32.0 || Util.getMillis() - this.lastClickTime < 250L) {
                 this.minecraft.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.UI_BUTTON_CLICK, 1.0f));
-                this.startConversion();
+                this.list.getScreen().openConvertOptions(this.summary.getPath());
                 return true;
             }
             this.lastClickTime = Util.getMillis();
             return super.mouseClicked(event, doubleClick);
-        }
-
-        public void startConversion() {
-            var connection = this.minecraft.getConnection();
-            var level = this.minecraft.level;
-            var cached = com.moulberry.fbrtoworld.FbrToWorldMod.cachedRegistryAccess;
-
-            com.moulberry.fbrtoworld.FbrToWorldMod.LOGGER.info(
-                    "[FbrToWorld] Convert clicked — connection={}, level={}, cachedRegistryAccess={}",
-                    connection != null, level != null, cached != null);
-
-            net.minecraft.core.RegistryAccess registryAccess;
-            String source;
-            if (connection != null) {
-                registryAccess = connection.registryAccess();
-                source = "live connection";
-            } else if (level != null) {
-                registryAccess = level.registryAccess();
-                source = "live level";
-            } else if (cached != null) {
-                registryAccess = cached;
-                source = "cached from last session";
-            } else {
-                registryAccess = null;
-                source = "none available";
-            }
-
-            com.moulberry.fbrtoworld.FbrToWorldMod.LOGGER.info(
-                    "[FbrToWorld] Using registry access source: {}", source);
-
-            if (registryAccess == null) {
-                com.moulberry.fbrtoworld.FbrToWorldMod.LOGGER.info(
-                        "[FbrToWorld] No live/cached registries — loading vanilla registries in the background");
-                this.startConversionAfterLoadingRegistries();
-                return;
-            }
-
-            boolean started = com.moulberry.fbrtoworld.FbrWorldConverter.start(
-                    this.summary.getPath(), registryAccess, this.minecraft);
-            com.moulberry.fbrtoworld.FbrToWorldMod.LOGGER.info(
-                    "[FbrToWorld] FbrWorldConverter.start() returned: {}", started);
-            if (started) {
-                this.minecraft.setScreen(new FbrConvertProgressScreen(this.list.getScreen()));
-            }
-        }
-
-        private void startConversionAfterLoadingRegistries() {
-            net.minecraft.client.gui.screens.Screen previousScreen = this.list.getScreen();
-            this.minecraft.setScreen(new net.minecraft.client.gui.screens.GenericMessageScreen(
-                    net.minecraft.network.chat.Component.literal("Loading registries...")));
-
-            com.moulberry.fbrtoworld.FbrRegistryLoader.loadVanillaRegistries().thenAccept(registryAccess -> {
-                this.minecraft.execute(() -> {
-                    com.moulberry.fbrtoworld.FbrToWorldMod.LOGGER.info(
-                            "[FbrToWorld] Vanilla registries loaded, starting conversion");
-                    boolean started = com.moulberry.fbrtoworld.FbrWorldConverter.start(
-                            this.summary.getPath(), registryAccess, this.minecraft);
-                    if (started) {
-                        this.minecraft.setScreen(new FbrConvertProgressScreen(previousScreen));
-                    } else {
-                        this.minecraft.setScreen(previousScreen);
-                    }
-                });
-            }).exceptionally(throwable -> {
-                this.minecraft.execute(() -> {
-                    com.moulberry.fbrtoworld.FbrToWorldMod.LOGGER.error(
-                            "[FbrToWorld] Failed to load vanilla registries", throwable);
-                    this.minecraft.setScreen(new net.minecraft.client.gui.screens.AlertScreen(
-                            () -> this.minecraft.setScreen(previousScreen),
-                            net.minecraft.network.chat.Component.literal("Couldn't Load Registries"),
-                            net.minecraft.network.chat.Component.literal(
-                                    "Failed to load vanilla registries: " + throwable.getMessage()
-                                            + " — try joining any world once this session instead."),
-                            net.minecraft.network.chat.Component.literal("Ok"),
-                            true
-                    ));
-                });
-                return null;
-            });
         }
 
         public void deleteReplay() {
@@ -272,6 +247,7 @@ public abstract class FbrReplaySelectionEntry extends ObjectSelectionList.Entry<
             } catch (IOException e) {
                 LOGGER.error("Failed to delete replay {}", this.summary.getReplayId(), e);
             }
+            this.list.removeFromCombine(this.summary.getPath());
             this.list.reloadReplayList();
         }
 

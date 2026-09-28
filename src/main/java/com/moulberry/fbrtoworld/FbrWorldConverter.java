@@ -45,6 +45,13 @@ public class FbrWorldConverter {
     public static volatile String progressResultMessage = "";
     public static volatile boolean progressFailed = false;
 
+    public static volatile int progressRecording = 0;
+    public static volatile int progressRecordingCount = 0;
+    public static volatile String progressRecordingName = "";
+
+    public static volatile Path progressWorldPath = null;
+    public static volatile Path progressStagingPath = null;
+
     public static void cancel() {
         FbrToWorldMod.LOGGER.info("[FbrToWorld] Cancel requested by user");
         cancelRequested = true;
@@ -53,36 +60,61 @@ public class FbrWorldConverter {
     }
 
     public static boolean start(Path fbrPath, RegistryAccess registryAccess, Minecraft mc) {
-        FbrToWorldMod.LOGGER.info("[FbrToWorld] start() called — path={}, alreadyRunning={}", fbrPath, running);
+        return start(Collections.singletonList(fbrPath), registryAccess, mc);
+    }
+
+    public static boolean start(List<Path> fbrPaths, RegistryAccess registryAccess, Minecraft mc) {
+        return start(fbrPaths, registryAccess, mc, null);
+    }
+
+    public static boolean startImport(List<Path> fbrPaths, RegistryAccess registryAccess, Minecraft mc, Path targetWorld) {
+        return start(fbrPaths, registryAccess, mc, targetWorld);
+    }
+
+    private static boolean start(List<Path> fbrPaths, RegistryAccess registryAccess, Minecraft mc, Path existingWorldTarget) {
+        final boolean importMode = existingWorldTarget != null;
+        FbrToWorldMod.LOGGER.info("[FbrToWorld] start() called — {} recording(s)={}, alreadyRunning={}, importMode={}",
+                fbrPaths.size(), fbrPaths, running, importMode);
         if (running) {
             FbrToWorldMod.LOGGER.warn("[FbrToWorld] start() aborted — a conversion is already running");
             return false;
         }
+        if (fbrPaths.isEmpty()) {
+            FbrToWorldMod.LOGGER.warn("[FbrToWorld] start() aborted — no recordings given");
+            return false;
+        }
+
+        final List<Path> inputs = new ArrayList<>(fbrPaths);
+
         running = true;
         cancelRequested = false;
         progressPhase = "Starting...";
         progressCurrent = 0;
         progressTotal = 0;
         progressWorldName = "";
+        progressWorldPath = null;
+        progressStagingPath = null;
         progressDone = false;
         progressResultMessage = "";
         progressFailed = false;
+        progressRecording = 0;
+        progressRecordingCount = inputs.size();
+        progressRecordingName = "";
         Thread t = new Thread(() -> {
             try {
-                FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion thread started for {}", fbrPath);
-                convert(fbrPath, registryAccess, mc);
-                FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion thread completed normally for {}", fbrPath);
+                FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion thread started for {}", inputs);
+                convert(inputs, registryAccess, mc, existingWorldTarget);
+                FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion thread completed normally for {}", inputs);
             } catch (CancellationException e) {
                 FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion cancelled by user");
-                clearActionBar(mc);
+                cleanupAfterCancel(mc, importMode);
                 sendMessage(mc, "§e[FbrToWorld] Conversion cancelled.");
                 progressResultMessage = "Cancelled.";
                 progressDone = true;
             } catch (Exception e) {
                 if (cancelRequested) {
-
                     FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion stopped due to cancellation");
-                    clearActionBar(mc);
+                    cleanupAfterCancel(mc, importMode);
                     sendMessage(mc, "§e[FbrToWorld] Conversion cancelled.");
                     progressResultMessage = "Cancelled.";
                     progressDone = true;
@@ -106,34 +138,405 @@ public class FbrWorldConverter {
         return true;
     }
 
+    private static void cleanupAfterCancel(Minecraft mc, boolean importMode) {
+        clearActionBar(mc);
+        if (importMode) {
+            if (progressStagingPath != null) {
+                deleteRecursivelyQuiet(progressStagingPath);
+                progressStagingPath = null;
+            }
+        } else if (progressWorldPath != null) {
+            deleteRecursivelyQuiet(progressWorldPath);
+            sendMessage(mc, "§e[FbrToWorld] Deleted the incomplete world.");
+            progressWorldPath = null;
+        }
+    }
+
+    private static void deleteRecursivelyQuiet(Path root) {
+        if (root == null || !Files.exists(root)) return;
+        try (var walk = Files.walk(root)) {
+            walk.sorted(Comparator.reverseOrder()).forEach(p -> {
+                try { Files.delete(p); }
+                catch (IOException e) { FbrToWorldMod.LOGGER.warn("[FbrToWorld] Failed to delete {}: {}", p, e.getMessage()); }
+            });
+        } catch (IOException e) {
+            FbrToWorldMod.LOGGER.warn("[FbrToWorld] Failed to clean up {}: {}", root, e.getMessage());
+        }
+    }
+
+    private static void mergeRegionDir(Path stagedDir, Path realDir) throws IOException {
+        if (!Files.isDirectory(stagedDir)) return;
+        Files.createDirectories(realDir);
+        try (var files = Files.list(stagedDir)) {
+            for (Path staged : (Iterable<Path>) files::iterator) {
+                if (!staged.getFileName().toString().endsWith(".mca")) continue;
+                Path real = realDir.resolve(staged.getFileName().toString());
+                RegionFileMerger.mergeInto(staged, real);
+            }
+        }
+    }
+
     private static void checkCancelled() {
         if (cancelRequested || Thread.currentThread().isInterrupted()) {
             throw new CancellationException("Conversion cancelled");
         }
     }
 
-    private static void convert(Path fbrPath, RegistryAccess registryAccess, Minecraft mc) throws Exception {
-        FbrToWorldMod.LOGGER.info("[FbrToWorld] convert() — checking file exists: {}", fbrPath);
-        if (!Files.exists(fbrPath)) {
-            FbrToWorldMod.LOGGER.error("[FbrToWorld] File not found: {}", fbrPath);
-            sendMessage(mc, "§c[FbrToWorld] File not found: " + fbrPath);
+    private static void convert(List<Path> fbrPaths, RegistryAccess registryAccess, Minecraft mc, Path existingWorldTarget) throws Exception {
+
+        List<Path> inputs = new ArrayList<>();
+        for (Path p : fbrPaths) {
+            if (p == null) continue;
+            if (inputs.contains(p)) continue;
+            if (!Files.exists(p)) {
+                FbrToWorldMod.LOGGER.error("[FbrToWorld] File not found: {}", p);
+                sendMessage(mc, "§c[FbrToWorld] File not found (skipping): " + p.getFileName());
+                continue;
+            }
+            inputs.add(p);
+        }
+
+        if (inputs.isEmpty()) {
+            sendMessage(mc, "§c[FbrToWorld] No usable recordings — nothing to convert.");
+            progressFailed = true;
+            progressResultMessage = "No usable recordings.";
+            progressDone = true;
             return;
         }
-        sendMessage(mc, "§a[FbrToWorld] Opening " + fbrPath.getFileName() + " ...");
+
+        final int recordingCount = inputs.size();
+        progressRecordingCount = recordingCount;
+
+        if (recordingCount == 1) {
+            sendMessage(mc, "§a[FbrToWorld] Opening " + inputs.get(0).getFileName() + " ...");
+        } else {
+            sendMessage(mc, "§a[FbrToWorld] Combining " + recordingCount + " recordings into one world...");
+            for (int i = 0; i < recordingCount; i++) {
+                sendMessage(mc, "§7[FbrToWorld]   " + (i + 1) + ". " + inputs.get(i).getFileName());
+            }
+            sendMessage(mc, "§7[FbrToWorld] Overlapping chunks: later recordings override earlier ones.");
+        }
+
+        var gamePacketCodec = GameProtocols.CLIENTBOUND_TEMPLATE
+                .bind(RegistryFriendlyByteBuf.decorator(registryAccess))
+                .codec();
+
+        sendMessage(mc, "§a[FbrToWorld] Phase 1/3 & 2/3: Indexing chunks and scanning timelines...");
+
+        List<Map<String, Map<Long, Integer>>> scans = new ArrayList<>();
+        for (int r = 0; r < recordingCount; r++) {
+            checkCancelled();
+            progressRecording = r + 1;
+            progressRecordingName = inputs.get(r).getFileName().toString();
+            scans.add(scanRecording(inputs.get(r), r, recordingCount,
+                    gamePacketCodec, registryAccess, mc));
+        }
+
+        Map<String, Set<Long>> merged = new LinkedHashMap<>();
+        int scannedTotal = 0;
+        for (int r = 0; r < recordingCount; r++) {
+            for (var dimEntry : scans.get(r).entrySet()) {
+                Set<Long> target = merged.computeIfAbsent(dimEntry.getKey(), k -> new LinkedHashSet<>());
+                scannedTotal += dimEntry.getValue().size();
+                target.addAll(dimEntry.getValue().keySet());
+            }
+        }
+
+        int totalChunks = 0;
+        for (var m : merged.values()) totalChunks += m.size();
+        int overlapping = scannedTotal - totalChunks;
+
+        sendMessage(mc, "§a[FbrToWorld] Scan done: " + totalChunks + " unique chunks across "
+                + merged.size() + " dimension(s)"
+                + (recordingCount > 1
+                    ? " from " + recordingCount + " recordings (" + overlapping + " overlapping chunk(s) merged)"
+                    : ""));
+
+        if (merged.isEmpty()) {
+            sendMessage(mc, "§c[FbrToWorld] No chunks found — nothing to export.");
+            progressFailed = true;
+            progressResultMessage = "No chunks found.";
+            progressDone = true;
+            return;
+        }
+
+        List<Map<Integer, String>> candidatesPerRecording = new ArrayList<>();
+        for (int r = 0; r < recordingCount; r++) {
+            Map<Integer, String> byIndex = new HashMap<>();
+            for (var dimEntry : scans.get(r).entrySet()) {
+                for (int chunkIndex : dimEntry.getValue().values()) {
+                    byIndex.put(chunkIndex, dimEntry.getKey());
+                }
+            }
+            candidatesPerRecording.add(byIndex);
+        }
+
+        if (recordingCount > 1) {
+            for (int r = 0; r < recordingCount; r++) {
+                Map<String, Map<Long, Integer>> scan = scans.get(r);
+                int scannedHere = 0;
+                int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE;
+                int minZ = Integer.MAX_VALUE, maxZ = Integer.MIN_VALUE;
+                StringBuilder dims = new StringBuilder();
+                for (var dimEntry : scan.entrySet()) {
+                    scannedHere += dimEntry.getValue().size();
+                    if (dims.length() > 0) dims.append(", ");
+                    dims.append(dimEntry.getKey()).append(" x").append(dimEntry.getValue().size());
+                    for (long posKey : dimEntry.getValue().keySet()) {
+                        int cx = ChunkPos.getX(posKey);
+                        int cz = ChunkPos.getZ(posKey);
+                        if (cx < minX) minX = cx;
+                        if (cx > maxX) maxX = cx;
+                        if (cz < minZ) minZ = cz;
+                        if (cz > maxZ) maxZ = cz;
+                    }
+                }
+                int kept = candidatesPerRecording.get(r).size();
+                String area = scannedHere == 0 ? "no chunks"
+                        : "blocks X " + (minX * 16) + ".." + (maxX * 16 + 15)
+                          + ", Z " + (minZ * 16) + ".." + (maxZ * 16 + 15);
+                sendMessage(mc, "§7[FbrToWorld]   " + (r + 1) + ". " + inputs.get(r).getFileName()
+                        + " → " + scannedHere + " chunks (" + kept + " candidate positions)");
+                sendMessage(mc, "§8[FbrToWorld]      " + area
+                        + " | dims: " + (dims.length() == 0 ? "none" : dims));
+                FbrToWorldMod.LOGGER.info("[FbrToWorld] Recording {} ({}): scanned={} kept={} area={} dims={}",
+                        r + 1, inputs.get(r).getFileName(), scannedHere, kept, area, dims);
+            }
+        }
+
+        boolean importMode = existingWorldTarget != null;
+        Path worldPath;
+        Path stagingRoot = null;
+
+        if (importMode) {
+            worldPath = existingWorldTarget;
+            if (!Files.isDirectory(worldPath)) {
+                sendMessage(mc, "§c[FbrToWorld] Target world not found: " + worldPath);
+                progressFailed = true;
+                progressResultMessage = "Target world not found.";
+                progressDone = true;
+                return;
+            }
+            stagingRoot = Files.createTempDirectory("fbr-import-");
+            progressStagingPath = stagingRoot;
+            progressWorldName = worldPath.getFileName().toString();
+            sendMessage(mc, "§a[FbrToWorld] Importing into existing world: " + worldPath.getFileName());
+        } else {
+            String baseName = inputs.get(0).getFileName().toString()
+                    .replaceAll("\\.[^.]+$", "")
+                    .replaceAll("[\\\\/:*?\"<>|]", "_");
+            if (recordingCount > 1) {
+                baseName = baseName + " +" + (recordingCount - 1);
+            }
+            Path savesDir = mc.gameDirectory.toPath().resolve("saves");
+            worldPath = savesDir.resolve(baseName);
+            if (Files.exists(worldPath)) {
+                int i = 1;
+                while (Files.exists(savesDir.resolve(baseName + "_" + i))) i++;
+                worldPath = savesDir.resolve(baseName + "_" + i);
+            }
+            Files.createDirectories(worldPath);
+            progressWorldPath = worldPath;
+            progressWorldName = worldPath.getFileName().toString();
+            writeLevelDat(worldPath, worldPath.getFileName().toString());
+        }
+
+        var biomeRegistry = registryAccess.lookupOrThrow(Registries.BIOME);
+        var ops            = registryAccess.createSerializationContext(NbtOps.INSTANCE);
+        var blockCodec     = PalettedContainer.codecRW(
+                BlockState.CODEC,
+                Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY),
+                Blocks.AIR.defaultBlockState());
+        com.mojang.serialization.Codec<PalettedContainerRO<Holder<Biome>>> biomeCodec = PalettedContainer.codecRO(
+                biomeRegistry.holderByNameCodec(),
+                Strategy.createForBiomes(biomeRegistry.asHolderIdMap()),
+                biomeRegistry.getOrThrow(Biomes.PLAINS));
+
+        Path writeRoot = importMode ? stagingRoot : worldPath;
+
+        Map<String, Path> dimPaths = new LinkedHashMap<>();
+        for (String dimId : merged.keySet()) {
+            Path dp = resolveDimPath(writeRoot, dimId);
+            Files.createDirectories(dp.resolve("region"));
+            Files.createDirectories(dp.resolve("entities"));
+            dimPaths.put(dimId, dp);
+        }
+
+        sendMessage(mc, "§a[FbrToWorld] Phase 3/3: Writing chunks...");
+
+        Map<String, Map<Long, RegionFileWriter>> regionWriters = new HashMap<>();
+        Map<String, Map<Long, RegionFileWriter>> entityWriters = new HashMap<>();
+        int written = 0, skipped = 0, keptTerrain = 0;
+        int[] writtenPerRecording = new int[recordingCount];
+        int[] skippedPerRecording = new int[recordingCount];
+        int processed = 0;
+
+        Map<String, Map<Long, Boolean>> placed = new HashMap<>();
+
+        try {
+            for (int r = 0; r < recordingCount; r++) {
+                checkCancelled();
+                Map<Integer, String> winnerIndexToDim = candidatesPerRecording.get(r);
+                if (winnerIndexToDim.isEmpty()) continue;
+
+                progressRecording = r + 1;
+                progressRecordingName = inputs.get(r).getFileName().toString();
+                String tag = recordingCount > 1 ? " [" + (r + 1) + "/" + recordingCount + "]" : "";
+
+                try (FileSystem zip = FileSystems.newFileSystem(inputs.get(r))) {
+                    List<Path> cacheFiles = listCacheFiles(zip);
+                    int globalIndex = 0;
+
+                    for (Path cacheFile : cacheFiles) {
+                        try (InputStream is = Files.newInputStream(cacheFile)) {
+                            while (true) {
+                                byte[] sb = is.readNBytes(4);
+                                if (sb.length < 4) break;
+                                int size = readInt4(sb, 0);
+                                if (size <= 0) break;
+
+                                int idx = globalIndex++;
+                                String dim = winnerIndexToDim.get(idx);
+
+                                if (dim == null) {
+                                    skipFully(is, size);
+                                    continue;
+                                }
+
+                                if (processed % 16 == 0) {
+                                    checkCancelled();
+                                    String shortDim = dim.contains(":") ? dim.split(":")[1] : dim;
+                                    setActionBar(mc, "Writing " + shortDim + tag, processed, scannedTotal);
+                                }
+                                processed++;
+
+                                byte[] data = is.readNBytes(size);
+                                if (data.length < size) break;
+
+                                var buf = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(data), registryAccess);
+                                try {
+                                    var pkt = gamePacketCodec.decode(buf);
+                                    if (pkt instanceof ClientboundLevelChunkWithLightPacket cp) {
+                                        ChunkPos pos      = new ChunkPos(cp.getX(), cp.getZ());
+                                        long regionKey    = ChunkPos.asLong(pos.getRegionX(), pos.getRegionZ());
+                                        String regionName = "r." + pos.getRegionX() + "." + pos.getRegionZ() + ".mca";
+                                        Path dimPath      = dimPaths.get(dim);
+
+                                        int[] blockCount = new int[1];
+                                        CompoundTag chunkNbt  = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess, dim, blockCount);
+                                        boolean hasBlocks = blockCount[0] > 0;
+
+                                        Map<Long, Boolean> placedInDim = placed.computeIfAbsent(dim, k -> new HashMap<>());
+                                        long posKey = ChunkPos.asLong(pos.x, pos.z);
+                                        Boolean alreadyPlaced = placedInDim.get(posKey);
+
+                                        if (alreadyPlaced != null && !hasBlocks) {
+
+                                            keptTerrain++;
+                                            continue;
+                                        }
+
+                                        CompoundTag entityNbt = buildEntityChunkNbt(pos);
+
+                                        final Path dPath  = dimPath;
+                                        final String fDim = dim;
+                                        regionWriters.computeIfAbsent(fDim, k -> new HashMap<>())
+                                                .computeIfAbsent(regionKey, k -> {
+                                                    try { return new RegionFileWriter(dPath.resolve("region").resolve(regionName)); }
+                                                    catch (Exception e) { throw new RuntimeException(e); }
+                                                }).write(pos, chunkNbt);
+                                        entityWriters.computeIfAbsent(fDim, k -> new HashMap<>())
+                                                .computeIfAbsent(regionKey, k -> {
+                                                    try { return new RegionFileWriter(dPath.resolve("entities").resolve(regionName)); }
+                                                    catch (Exception e) { throw new RuntimeException(e); }
+                                                }).write(pos, entityNbt);
+
+                                        placedInDim.put(posKey, hasBlocks || Boolean.TRUE.equals(alreadyPlaced));
+                                        if (alreadyPlaced == null) written++;
+                                        writtenPerRecording[r]++;
+                                    }
+                                } catch (Exception e) {
+                                    FbrToWorldMod.LOGGER.warn("[FbrToWorld] Skipped {}/idx {} (recording {}): {}",
+                                            dim, idx, r + 1, e.getMessage());
+                                    skipped++;
+                                    skippedPerRecording[r]++;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } finally {
+            for (var m : regionWriters.values()) for (var w : m.values()) closeQuietly(w);
+            for (var m : entityWriters.values()) for (var w : m.values()) closeQuietly(w);
+        }
+
+        clearActionBar(mc);
+
+        if (importMode) {
+            sendMessage(mc, "§a[FbrToWorld] Merging chunks into " + worldPath.getFileName() + "...");
+            for (String dimId : merged.keySet()) {
+                Path stagedDim = resolveDimPath(stagingRoot, dimId);
+                Path realDim = resolveDimPath(worldPath, dimId);
+                Files.createDirectories(realDim.resolve("region"));
+                Files.createDirectories(realDim.resolve("entities"));
+                mergeRegionDir(stagedDim.resolve("region"), realDim.resolve("region"));
+                mergeRegionDir(stagedDim.resolve("entities"), realDim.resolve("entities"));
+            }
+            deleteRecursivelyQuiet(stagingRoot);
+            progressStagingPath = null;
+        }
+
+        if (recordingCount > 1) {
+            for (int r = 0; r < recordingCount; r++) {
+                String line = "  " + (r + 1) + ". " + inputs.get(r).getFileName()
+                        + " → wrote " + writtenPerRecording[r] + " chunks"
+                        + (skippedPerRecording[r] > 0 ? " (" + skippedPerRecording[r] + " failed)" : "");
+                sendMessage(mc, (writtenPerRecording[r] == 0 ? "§c" : "§7") + "[FbrToWorld]" + line);
+                FbrToWorldMod.LOGGER.info("[FbrToWorld]{}", line);
+            }
+        }
+
+        if (keptTerrain > 0) {
+            sendMessage(mc, "§7[FbrToWorld] " + keptTerrain
+                    + " air-only copies skipped so existing terrain wasn't erased.");
+            FbrToWorldMod.LOGGER.info("[FbrToWorld] {} air-only chunk copies skipped", keptTerrain);
+        }
+
+        String resultMsg = written + " chunks written"
+                + (skipped > 0 ? " (" + skipped + " skipped)" : "")
+                + " across " + merged.size() + " dimension(s)"
+                + (recordingCount > 1 ? " from " + recordingCount + " recordings" : "")
+                + " → saves/" + worldPath.getFileName();
+        sendMessage(mc, "§a[FbrToWorld] Done! " + resultMsg);
+        progressPhase = "Done";
+        progressCurrent = written;
+        progressTotal = totalChunks;
+        progressResultMessage = resultMsg;
+        progressDone = true;
+    }
+
+    private static Map<String, Map<Long, Integer>> scanRecording(
+            Path fbrPath,
+            int recordingIdx,
+            int recordingCount,
+            net.minecraft.network.codec.StreamCodec<io.netty.buffer.ByteBuf, net.minecraft.network.protocol.Packet<? super net.minecraft.network.protocol.game.ClientGamePacketListener>> gamePacketCodec,
+            RegistryAccess registryAccess,
+            Minecraft mc) throws Exception {
+
+        Map<String, Map<Long, Integer>> dimPosToWinnerIndex = new LinkedHashMap<>();
+        String tag = recordingCount > 1 ? " [" + (recordingIdx + 1) + "/" + recordingCount + "]" : "";
 
         try (FileSystem zip = FileSystems.newFileSystem(fbrPath)) {
 
             Path cacheDir = zip.getPath("/level_chunk_caches");
             if (!Files.exists(cacheDir)) {
-                sendMessage(mc, "§c[FbrToWorld] No level_chunk_caches found — may be an older .fbr format.");
-                return;
+                sendMessage(mc, "§c[FbrToWorld] " + fbrPath.getFileName()
+                        + ": no level_chunk_caches found — skipping (may be an older .fbr format).");
+                return dimPosToWinnerIndex;
             }
 
-            List<Path> cacheFiles = new ArrayList<>();
-            try (DirectoryStream<Path> ds = Files.newDirectoryStream(cacheDir)) {
-                for (Path p : ds) cacheFiles.add(p);
-            }
-            cacheFiles.sort(Comparator.comparingInt(p -> Integer.parseInt(p.getFileName().toString())));
+            List<Path> cacheFiles = listCacheFiles(zip);
             int totalCacheFiles = cacheFiles.size();
 
             List<Path> flashbackFiles = new ArrayList<>();
@@ -144,19 +547,13 @@ public class FbrWorldConverter {
             flashbackFiles.sort(Comparator.comparing(p -> p.getFileName().toString()));
             int totalFbFiles = flashbackFiles.size();
 
-            var gamePacketCodec = GameProtocols.CLIENTBOUND_TEMPLATE
-                    .bind(RegistryFriendlyByteBuf.decorator(registryAccess))
-                    .codec();
-
-            sendMessage(mc, "§a[FbrToWorld] Phase 1/3: Indexing chunk positions...");
-
             Map<Integer, int[]> indexToXZ = new HashMap<>();
             int totalPackets = 0;
             byte[] headBuf = new byte[16];
 
             for (int cfi = 0; cfi < totalCacheFiles; cfi++) {
                 checkCancelled();
-                setActionBar(mc, "Indexing cache", cfi + 1, totalCacheFiles);
+                setActionBar(mc, "Indexing cache" + tag, cfi + 1, totalCacheFiles);
                 try (InputStream is = Files.newInputStream(cacheFiles.get(cfi))) {
                     while (true) {
                         byte[] sb = is.readNBytes(4);
@@ -182,18 +579,15 @@ public class FbrWorldConverter {
                 }
             }
 
-            sendMessage(mc, "§a[FbrToWorld] Phase 1 done: " + indexToXZ.size()
-                    + " of " + totalPackets + " entries indexed.");
+            FbrToWorldMod.LOGGER.info("[FbrToWorld] {}: indexed {} of {} cache entries",
+                    fbrPath.getFileName(), indexToXZ.size(), totalPackets);
 
-            sendMessage(mc, "§a[FbrToWorld] Phase 2/3: Scanning timeline...");
-
-            Map<String, Map<Long, Integer>> dimPosToWinnerIndex = new LinkedHashMap<>();
             String[] currentDim = {"minecraft:overworld"};
             final int MAGIC = 0xD780E884;
 
             for (int fbi = 0; fbi < totalFbFiles; fbi++) {
                 checkCancelled();
-                setActionBar(mc, "Scanning timeline", fbi + 1, totalFbFiles);
+                setActionBar(mc, "Scanning timeline" + tag, fbi + 1, totalFbFiles);
                 byte[] fbBytes = Files.readAllBytes(flashbackFiles.get(fbi));
                 FriendlyByteBuf fbuf = new FriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(fbBytes));
 
@@ -217,140 +611,53 @@ public class FbrWorldConverter {
                 fbuf.readBytes(snapBytes);
                 FriendlyByteBuf snapBuf = new FriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(snapBytes));
                 scanActions(snapBuf, gamePacketId, chunkCachedId,
-                        gamePacketCodec, registryAccess, indexToXZ, currentDim, dimPosToWinnerIndex);
+                        gamePacketCodec, registryAccess, indexToXZ,
+                        currentDim, dimPosToWinnerIndex);
 
                 scanActions(fbuf, gamePacketId, chunkCachedId,
-                        gamePacketCodec, registryAccess, indexToXZ, currentDim, dimPosToWinnerIndex);
+                        gamePacketCodec, registryAccess, indexToXZ,
+                        currentDim, dimPosToWinnerIndex);
             }
+        }
 
-            Map<Integer, String> winnerIndexToDim = new HashMap<>();
-            for (var e : dimPosToWinnerIndex.entrySet())
-                for (int idx : e.getValue().values())
-                    winnerIndexToDim.put(idx, e.getKey());
+        return dimPosToWinnerIndex;
+    }
 
-            int totalChunks = winnerIndexToDim.size();
-            sendMessage(mc, "§a[FbrToWorld] Phase 2 done: " + totalChunks + " unique chunks across "
-                    + dimPosToWinnerIndex.size() + " dimension(s).");
+    private static List<Path> listCacheFiles(FileSystem zip) throws IOException {
+        List<Path> cacheFiles = new ArrayList<>();
+        Path cacheDir = zip.getPath("/level_chunk_caches");
+        if (!Files.exists(cacheDir)) return cacheFiles;
+        try (DirectoryStream<Path> ds = Files.newDirectoryStream(cacheDir)) {
+            for (Path p : ds) cacheFiles.add(p);
+        }
+        cacheFiles.sort(Comparator.comparingInt(p -> cacheFileOrder(p)));
+        return cacheFiles;
+    }
 
-            if (dimPosToWinnerIndex.isEmpty()) {
-                sendMessage(mc, "§c[FbrToWorld] No chunks found — nothing to export.");
-                return;
+    private static int cacheFileOrder(Path p) {
+        String name = p.getFileName().toString();
+        try {
+            return Integer.parseInt(name);
+        } catch (NumberFormatException e) {
+            StringBuilder digits = new StringBuilder();
+            for (int i = 0; i < name.length(); i++) {
+                char c = name.charAt(i);
+                if (c >= '0' && c <= '9') digits.append(c);
             }
-
-            String baseName = fbrPath.getFileName().toString()
-                    .replaceAll("\\.[^.]+$", "")
-                    .replaceAll("[\\\\/:*?\"<>|]", "_");
-            Path savesDir = mc.gameDirectory.toPath().resolve("saves");
-            Path worldPath = savesDir.resolve(baseName);
-            if (Files.exists(worldPath)) {
-                int i = 1;
-                while (Files.exists(savesDir.resolve(baseName + "_" + i))) i++;
-                worldPath = savesDir.resolve(baseName + "_" + i);
+            if (digits.isEmpty()) return Integer.MAX_VALUE;
+            try {
+                return Integer.parseInt(digits.toString());
+            } catch (NumberFormatException e2) {
+                return Integer.MAX_VALUE;
             }
-            Files.createDirectories(worldPath);
-            progressWorldName = worldPath.getFileName().toString();
-            writeLevelDat(worldPath, baseName);
+        }
+    }
 
-            var biomeRegistry = registryAccess.lookupOrThrow(Registries.BIOME);
-            var ops            = registryAccess.createSerializationContext(NbtOps.INSTANCE);
-            var blockCodec     = PalettedContainer.codecRW(
-                    BlockState.CODEC,
-                    Strategy.createForBlockStates(Block.BLOCK_STATE_REGISTRY),
-                    Blocks.AIR.defaultBlockState());
-            com.mojang.serialization.Codec<PalettedContainerRO<Holder<Biome>>> biomeCodec = PalettedContainer.codecRO(
-                    biomeRegistry.holderByNameCodec(),
-                    Strategy.createForBiomes(biomeRegistry.asHolderIdMap()),
-                    biomeRegistry.getOrThrow(Biomes.PLAINS));
-
-            Map<String, Path> dimPaths = new LinkedHashMap<>();
-            for (String dimId : dimPosToWinnerIndex.keySet()) {
-                Path dp = resolveDimPath(worldPath, dimId);
-                Files.createDirectories(dp.resolve("region"));
-                Files.createDirectories(dp.resolve("entities"));
-                dimPaths.put(dimId, dp);
-            }
-
-            sendMessage(mc, "§a[FbrToWorld] Phase 3/3: Writing chunks...");
-
-            Map<String, Map<Long, RegionFileWriter>> regionWriters = new HashMap<>();
-            Map<String, Map<Long, RegionFileWriter>> entityWriters = new HashMap<>();
-            int written = 0, skipped = 0;
-            int globalIndex = 0;
-
-            for (int cfi = 0; cfi < totalCacheFiles; cfi++) {
-                try (InputStream is = Files.newInputStream(cacheFiles.get(cfi))) {
-                    while (true) {
-                        byte[] sb = is.readNBytes(4);
-                        if (sb.length < 4) break;
-                        int size = readInt4(sb, 0);
-                        if (size <= 0) break;
-
-                        int idx = globalIndex++;
-                        String dim = winnerIndexToDim.get(idx);
-
-                        if (dim == null) {
-                            skipFully(is, size);
-                            continue;
-                        }
-
-                        if (written % 16 == 0) {
-                            checkCancelled();
-                            String shortDim = dim.contains(":") ? dim.split(":")[1] : dim;
-                            setActionBar(mc, "Writing " + shortDim, written, totalChunks);
-                        }
-
-                        byte[] data = is.readNBytes(size);
-                        if (data.length < size) break;
-
-                        var buf = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(data), registryAccess);
-                        try {
-                            var pkt = gamePacketCodec.decode(buf);
-                            if (pkt instanceof ClientboundLevelChunkWithLightPacket cp) {
-                                ChunkPos pos      = new ChunkPos(cp.getX(), cp.getZ());
-                                long regionKey    = ChunkPos.asLong(pos.getRegionX(), pos.getRegionZ());
-                                String regionName = "r." + pos.getRegionX() + "." + pos.getRegionZ() + ".mca";
-                                Path dimPath      = dimPaths.get(dim);
-
-                                CompoundTag chunkNbt  = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess, dim);
-                                CompoundTag entityNbt = buildEntityChunkNbt(pos);
-
-                                final Path dPath  = dimPath;
-                                final String fDim = dim;
-                                regionWriters.computeIfAbsent(fDim, k -> new HashMap<>())
-                                        .computeIfAbsent(regionKey, k -> {
-                                            try { return new RegionFileWriter(dPath.resolve("region").resolve(regionName)); }
-                                            catch (Exception e) { throw new RuntimeException(e); }
-                                        }).write(pos, chunkNbt);
-                                entityWriters.computeIfAbsent(fDim, k -> new HashMap<>())
-                                        .computeIfAbsent(regionKey, k -> {
-                                            try { return new RegionFileWriter(dPath.resolve("entities").resolve(regionName)); }
-                                            catch (Exception e) { throw new RuntimeException(e); }
-                                        }).write(pos, entityNbt);
-
-                                written++;
-                            }
-                        } catch (Exception e) {
-                            FbrToWorldMod.LOGGER.warn("[FbrToWorld] Skipped {}/idx {}: {}", dim, idx, e.getMessage());
-                            skipped++;
-                        }
-                    }
-                }
-            }
-
-            for (var m : regionWriters.values()) for (var w : m.values()) w.close();
-            for (var m : entityWriters.values()) for (var w : m.values()) w.close();
-
-            clearActionBar(mc);
-            String resultMsg = written + " chunks written"
-                    + (skipped > 0 ? " (" + skipped + " skipped)" : "")
-                    + " across " + dimPosToWinnerIndex.size() + " dimension(s)"
-                    + " → saves/" + worldPath.getFileName();
-            sendMessage(mc, "§a[FbrToWorld] Done! " + resultMsg);
-            progressPhase = "Done";
-            progressCurrent = written;
-            progressTotal = totalChunks;
-            progressResultMessage = resultMsg;
-            progressDone = true;
+    private static void closeQuietly(RegionFileWriter writer) {
+        try {
+            writer.close();
+        } catch (Exception e) {
+            FbrToWorldMod.LOGGER.warn("[FbrToWorld] Failed to close region file: {}", e.getMessage());
         }
     }
 
@@ -446,7 +753,8 @@ public class FbrWorldConverter {
             com.mojang.serialization.Codec<PalettedContainer<BlockState>> blockCodec,
             com.mojang.serialization.Codec<PalettedContainerRO<Holder<Biome>>> biomeCodec,
             RegistryAccess registryAccess,
-            String dimension) throws Exception {
+            String dimension,
+            int[] blockCountOut) throws Exception {
 
         int cx = packet.getX();
         int cz = packet.getZ();
@@ -492,7 +800,8 @@ public class FbrWorldConverter {
             CompoundTag sec = new CompoundTag();
             sec.putInt("Y", sectionY);
 
-            rfbb.readShort();
+            int nonAirInSection = rfbb.readShort();
+            if (nonAirInSection > 0) blockCountOut[0] += nonAirInSection;
 
             PalettedContainer<BlockState> states = new PalettedContainer<>(
                     Blocks.AIR.defaultBlockState(),

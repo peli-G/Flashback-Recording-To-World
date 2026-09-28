@@ -40,8 +40,21 @@ public class FbrConvertProgressScreen extends Screen {
 
         String worldName = FbrWorldConverter.progressWorldName.isEmpty()
                 ? "Replay" : FbrWorldConverter.progressWorldName;
+        int recordingCount = FbrWorldConverter.progressRecordingCount;
+
         guiGraphics.drawCenteredString(this.font,
-                "Converting Replay '" + worldName + "'", this.width / 2, 20, 0xFFFFFFFF);
+                recordingCount > 1
+                        ? "Combining " + recordingCount + " Replays into '" + worldName + "'"
+                        : "Converting Replay '" + worldName + "'",
+                this.width / 2, 20, 0xFFFFFFFF);
+
+        if (recordingCount > 1) {
+            int currentRecording = Math.max(1, Math.min(FbrWorldConverter.progressRecording, recordingCount));
+            String name = FbrWorldConverter.progressRecordingName;
+            String line = "Recording " + currentRecording + " / " + recordingCount
+                    + (name.isEmpty() ? "" : ": " + name);
+            guiGraphics.drawCenteredString(this.font, line, this.width / 2, 34, 0xFF909090);
+        }
 
         int current = FbrWorldConverter.progressCurrent;
         int total = Math.max(FbrWorldConverter.progressTotal, 1);

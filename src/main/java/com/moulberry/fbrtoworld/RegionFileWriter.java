@@ -7,23 +7,38 @@ import net.minecraft.world.level.ChunkPos;
 import java.io.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.zip.DeflaterOutputStream;
+
 
 public class RegionFileWriter implements Closeable {
 
     private static final int SECTOR_SIZE = 4096;
     private static final int HEADER_SECTORS = 2;
+    private static final int MAX_SECTORS = 255;
+    private static final int MAX_OPEN_HANDLES = 64;
+
+    private static final ArrayDeque<RegionFileWriter> OPEN_WRITERS = new ArrayDeque<>();
 
     private final Path path;
     private final int[] offsets = new int[1024];
     private final int[] timestamps = new int[1024];
-    private final byte[][] chunkData = new byte[1024][];
+    private final byte[] padding = new byte[SECTOR_SIZE];
 
-    public RegionFileWriter(Path path) {
+    private RandomAccessFile raf;
+    private boolean created = false;
+    private boolean finished = false;
+    private int nextSector = HEADER_SECTORS;
+
+    public RegionFileWriter(Path path) throws IOException {
         this.path = path;
+        Path parent = path.getParent();
+        if (parent != null) Files.createDirectories(parent);
     }
 
     public void write(ChunkPos pos, CompoundTag nbt) throws IOException {
+        if (this.finished) throw new IOException("Region file already closed: " + this.path);
+
         int index = (pos.x & 31) + (pos.z & 31) * 32;
 
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
@@ -42,32 +57,73 @@ public class RegionFileWriter implements Closeable {
         entry[4] = 2;
         System.arraycopy(compressed, 0, entry, 5, compressed.length);
 
-        chunkData[index] = entry;
-        timestamps[index] = (int)(System.currentTimeMillis() / 1000);
+        int sectors = (entry.length + SECTOR_SIZE - 1) / SECTOR_SIZE;
+        if (sectors > MAX_SECTORS) {
+
+            throw new IOException("Chunk " + pos.x + "," + pos.z
+                    + " is too large for the region format (" + entry.length + " bytes)");
+        }
+
+        this.ensureOpen();
+        this.raf.seek((long) this.nextSector * SECTOR_SIZE);
+        this.raf.write(entry);
+        int pad = SECTOR_SIZE - (entry.length % SECTOR_SIZE);
+        if (pad < SECTOR_SIZE) this.raf.write(this.padding, 0, pad);
+
+        this.offsets[index] = (this.nextSector << 8) | (sectors & 0xFF);
+        this.timestamps[index] = (int)(System.currentTimeMillis() / 1000);
+        this.nextSector += sectors;
     }
 
     @Override
     public void close() throws IOException {
-
-        int currentSector = HEADER_SECTORS;
-        for (int i = 0; i < 1024; i++) {
-            if (chunkData[i] == null) { offsets[i] = 0; continue; }
-            int sectors = (chunkData[i].length + SECTOR_SIZE - 1) / SECTOR_SIZE;
-            offsets[i] = (currentSector << 8) | (sectors & 0xFF);
-            currentSector += sectors;
+        if (this.finished) return;
+        try {
+            this.ensureOpen();
+            this.raf.seek(0L);
+            for (int off : this.offsets)    this.raf.writeInt(off);
+            for (int ts  : this.timestamps) this.raf.writeInt(ts);
+        } finally {
+            this.finished = true;
+            this.releaseHandle();
         }
+    }
 
-        Files.createDirectories(path.getParent());
-        try (RandomAccessFile raf = new RandomAccessFile(path.toFile(), "rw")) {
-            for (int off : offsets)    raf.writeInt(off);
-            for (int ts  : timestamps) raf.writeInt(ts);
-            for (int i = 0; i < 1024; i++) {
-                if (chunkData[i] == null) continue;
-                raf.write(chunkData[i]);
+    private void ensureOpen() throws IOException {
+        if (this.raf != null) return;
 
-                int pad = SECTOR_SIZE - (chunkData[i].length % SECTOR_SIZE);
-                if (pad < SECTOR_SIZE) raf.write(new byte[pad]);
-            }
+        this.raf = new RandomAccessFile(this.path.toFile(), "rw");
+        if (!this.created) {
+            this.raf.setLength(0L);
+
+            this.raf.write(new byte[SECTOR_SIZE * HEADER_SECTORS]);
+            this.created = true;
         }
+        registerOpen(this);
+    }
+
+    private void releaseHandle() {
+        unregisterOpen(this);
+        RandomAccessFile open = this.raf;
+        this.raf = null;
+        if (open == null) return;
+        try {
+            open.close();
+        } catch (IOException e) {
+            FbrToWorldMod.LOGGER.warn("[FbrToWorld] Failed to close region file {}: {}", this.path, e.getMessage());
+        }
+    }
+
+    private static synchronized void registerOpen(RegionFileWriter writer) {
+        OPEN_WRITERS.addLast(writer);
+        while (OPEN_WRITERS.size() > MAX_OPEN_HANDLES) {
+            RegionFileWriter victim = OPEN_WRITERS.peekFirst();
+            if (victim == null || victim == writer) break;
+            victim.releaseHandle();
+        }
+    }
+
+    private static synchronized void unregisterOpen(RegionFileWriter writer) {
+        OPEN_WRITERS.remove(writer);
     }
 }

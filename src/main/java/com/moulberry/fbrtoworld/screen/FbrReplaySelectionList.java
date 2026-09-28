@@ -8,6 +8,7 @@ import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.ObjectSelectionList;
 import net.minecraft.client.gui.narration.NarrationElementOutput;
 import net.minecraft.client.input.KeyEvent;
+import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.client.resources.sounds.SimpleSoundInstance;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.util.Util;
@@ -24,7 +25,13 @@ import java.util.concurrent.CompletionException;
 
 public class FbrReplaySelectionList extends ObjectSelectionList<FbrReplaySelectionEntry> {
 
+    public static final int CHECKBOX_GUTTER = 24;
+
+    
+    private static final LinkedHashSet<Path> COMBINE_SELECTION = new LinkedHashSet<>();
+
     private final FbrSelectReplayScreen screen;
+    private final boolean combineMode;
     private CompletableFuture<List<FbrPendingEntry>> pendingReplays;
     @Nullable
     private List<FbrPendingEntry> currentlyDisplayed;
@@ -35,15 +42,60 @@ public class FbrReplaySelectionList extends ObjectSelectionList<FbrReplaySelecti
 
     public FbrReplaySelectionList(FbrSelectReplayScreen screen, Minecraft minecraft, int width, int height,
                                    int y0, int itemHeight, String filter, FbrSorting sorting, boolean sortDescending,
-                                   @Nullable FbrReplaySelectionList previous) {
+                                   boolean combineMode, @Nullable FbrReplaySelectionList previous) {
         super(minecraft, width, height, y0, itemHeight);
         this.screen = screen;
+        this.combineMode = combineMode;
         this.loadingHeader = new FbrReplaySelectionEntry.LoadingHeader(minecraft);
         this.filter = filter;
         this.sorting = sorting;
         this.sortDescending = sortDescending;
         this.pendingReplays = previous != null ? previous.pendingReplays : this.loadReplays();
         this.fillLoadingReplays();
+    }
+
+    public boolean isCombineMode() { return this.combineMode; }
+
+    
+    public static void startCombineSession(@Nullable Path preselected) {
+        COMBINE_SELECTION.clear();
+        if (preselected != null) COMBINE_SELECTION.add(preselected);
+    }
+
+    
+    public int getCombineOrder(Path path) {
+        int i = 1;
+        for (Path p : COMBINE_SELECTION) {
+            if (p.equals(path)) return i;
+            i++;
+        }
+        return 0;
+    }
+
+    public void toggleCombine(Path path) {
+        if (!COMBINE_SELECTION.remove(path)) {
+            COMBINE_SELECTION.add(path);
+        }
+        this.screen.onCombineSelectionChanged();
+    }
+
+    public void removeFromCombine(Path path) {
+        if (COMBINE_SELECTION.remove(path)) {
+            this.screen.onCombineSelectionChanged();
+        }
+    }
+
+    
+    public List<Path> getCombineSelection() {
+        List<Path> result = new ArrayList<>();
+        for (Path p : COMBINE_SELECTION) {
+            if (Files.exists(p)) result.add(p);
+        }
+        return result;
+    }
+
+    public int getCombineCount() {
+        return this.getCombineSelection().size();
     }
 
     @Override
@@ -71,11 +123,38 @@ public class FbrReplaySelectionList extends ObjectSelectionList<FbrReplaySelecti
             FbrReplaySelectionEntry.ReplayListEntry entry = this.getReplayListEntry();
             if (entry != null) {
                 this.minecraft.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.UI_BUTTON_CLICK, 1.0f));
-                entry.startConversion();
+                if (this.combineMode) {
+                    this.toggleCombine(entry.summary.getPath());
+                } else {
+                    this.screen.openConvertOptions(entry.summary.getPath());
+                }
                 return true;
             }
         }
         return super.keyPressed(keyEvent);
+    }
+
+    /**
+     * The tick boxes are drawn in the gutter to the LEFT of each row, which is outside the row's
+     * hitbox - vanilla never routes those clicks to the entry. Catch them here instead.
+     */
+    @Override
+    public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
+        if (this.combineMode && event.button() == 0 && this.isMouseOver(event.x(), event.y())) {
+            int rowLeft = this.getRowLeft();
+            if (event.x() >= rowLeft - CHECKBOX_GUTTER && event.x() < rowLeft) {
+                for (FbrReplaySelectionEntry entry : this.children()) {
+                    if (entry instanceof FbrReplaySelectionEntry.ReplayListEntry replay
+                            && event.y() >= entry.getY() && event.y() < entry.getY() + entry.getHeight()) {
+                        this.minecraft.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.UI_BUTTON_CLICK, 1.0f));
+                        this.setSelected(replay);
+                        this.toggleCombine(replay.summary.getPath());
+                        return true;
+                    }
+                }
+            }
+        }
+        return super.mouseClicked(event, doubleClick);
     }
 
     @Override
@@ -204,7 +283,10 @@ public class FbrReplaySelectionList extends ObjectSelectionList<FbrReplaySelecti
     }
 
     @Override
-    public int getRowWidth() { return 270; }
+    public int getRowWidth() { return this.combineMode ? 270 - CHECKBOX_GUTTER : 270; }
+
+    @Override
+    public int getRowLeft() { return super.getRowLeft() + (this.combineMode ? CHECKBOX_GUTTER : 0); }
 
     @Override
     public void setSelected(@Nullable FbrReplaySelectionEntry entry) {
