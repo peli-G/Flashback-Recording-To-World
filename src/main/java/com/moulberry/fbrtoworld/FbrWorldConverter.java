@@ -55,6 +55,11 @@ public class FbrWorldConverter {
 
     public static volatile int progressThreads = 1;
 
+    /** World name typed on the "Select an option" screen (blank/null = use the Flashback recording's name). */
+    public static volatile String requestedWorldName = null;
+    /** The name being used by the conversion that's running now. */
+    private static volatile String activeWorldName = null;
+
     public static volatile Path progressWorldPath = null;
     public static volatile Path progressStagingPath = null;
 
@@ -107,6 +112,9 @@ public class FbrWorldConverter {
         progressRecordingCount = inputs.size();
         progressRecordingName = "";
         progressThreads = 1;
+        String typedName = requestedWorldName;
+        requestedWorldName = null;
+        activeWorldName = importMode || typedName == null || typedName.isBlank() ? null : typedName.trim();
         Thread t = new Thread(() -> {
             try {
                 FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion thread started for {}", inputs);
@@ -151,11 +159,31 @@ public class FbrWorldConverter {
         Path world = progressWorldPath;
         if (importMode || world == null || Files.exists(world.resolve("level.dat"))) return;
         try {
-            writeLevelDat(world, world.getFileName().toString());
+            writeLevelDat(world, levelNameFor(world));
             FbrStartSpawn.apply(world, mc);
         } catch (Exception ex) {
             FbrToWorldMod.LOGGER.warn("[FbrToWorld] Couldn't write level.dat for the partial world: {}", ex.getMessage());
         }
+    }
+
+    /** Turns a typed world name into a safe folder name, or null if nothing usable is left. */
+    private static String safeFolderName(String typed) {
+        if (typed == null) return null;
+        String name = typed.trim()
+                .replaceAll("[\\\\/:*?\"<>|]", "_")
+                .replaceAll("[\\p{Cntrl}]", "")
+                .replaceAll("[. ]+$", "");
+        if (name.length() > 64) name = name.substring(0, 64).trim();
+        if (name.isEmpty() || name.equals(".") || name.equals("..")) return null;
+        // Names Windows won't allow as folders
+        if (name.matches("(?i)(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\\..*)?")) name = "_" + name;
+        return name;
+    }
+
+    /** The name shown in Singleplayer: the typed name if there is one, otherwise the folder name. */
+    private static String levelNameFor(Path worldFolder) {
+        String typed = activeWorldName;
+        return typed != null && !typed.isBlank() ? typed : worldFolder.getFileName().toString();
     }
 
     private static void cleanupAfterCancel(Minecraft mc, boolean importMode) {
@@ -246,31 +274,102 @@ public class FbrWorldConverter {
     private record EncodedChunk(ChunkPos pos, boolean hasBlocks, byte[] chunkEntry, byte[] entityEntry,
                                 String decodeError, String encodeError) {}
 
-    /** Write-phase state; only touched from the conversion thread. */
+    /** Cache files read ahead in parallel while writing. */
+    private static final int READ_AHEAD = 3;
+
+    private record ReaderDone(int skipped) {}
+
+    /** Write-phase state. Counters are only touched from the conversion thread; chunk states are read by reader threads too. */
     private static final class WriteContext {
         final Map<String, Path> dimPaths;
         final Map<String, Map<Long, RegionFileWriter>> regionWriters;
         final Map<String, Map<Long, RegionFileWriter>> entityWriters;
-        final Map<String, Map<Long, Boolean>> placed;
+        /** dimension -> chunk position -> 1 (written, air only) or 2 (written with real blocks: final). */
+        final Map<String, java.util.concurrent.ConcurrentHashMap<Long, Byte>> state = new java.util.concurrent.ConcurrentHashMap<>();
+        final FbrChunkTranslator.Session translator;
+        final boolean lz4;
         final int[] writtenPerRecording;
         final int[] skippedPerRecording;
-        int written, skipped, keptTerrain;
+        final java.util.concurrent.atomic.AtomicLong olderCopiesSkipped = new java.util.concurrent.atomic.AtomicLong();
+        int written, skipped, processed;
 
         WriteContext(int recordingCount, Map<String, Path> dimPaths,
                      Map<String, Map<Long, RegionFileWriter>> regionWriters,
                      Map<String, Map<Long, RegionFileWriter>> entityWriters,
-                     Map<String, Map<Long, Boolean>> placed) {
+                     FbrChunkTranslator.Session translator, boolean lz4) {
             this.dimPaths = dimPaths;
             this.regionWriters = regionWriters;
             this.entityWriters = entityWriters;
-            this.placed = placed;
+            this.translator = translator;
+            this.lz4 = lz4;
             this.writtenPerRecording = new int[recordingCount];
             this.skippedPerRecording = new int[recordingCount];
         }
+
+        java.util.concurrent.ConcurrentHashMap<Long, Byte> stateFor(String dim) {
+            return this.state.computeIfAbsent(dim, k -> new java.util.concurrent.ConcurrentHashMap<>());
+        }
+
+        boolean isFinal(String dim, long posKey) {
+            var m = this.state.get(dim);
+            if (m == null) return false;
+            Byte b = m.get(posKey);
+            return b != null && b == 2;
+        }
+    }
+
+    @FunctionalInterface
+    private interface BatchSink {
+        void accept(List<PendingChunk> batch) throws Exception;
+    }
+
+    /**
+     * Reads one chunk-cache file, keeping only this recording's winning chunks that aren't
+     * already final from a newer recording. Batches go to the sink in file order.
+     */
+    private static void readCacheFile(Path cacheFile, int startIndex, Map<Integer, String> winnerIndexToDim,
+                                      Map<Integer, Long> posByIndex, WriteContext ctx, BatchSink sink,
+                                      int[] skippedOut, int[] nextIndexOut) throws Exception {
+        int idx = startIndex;
+        List<PendingChunk> batch = new ArrayList<>(BATCH_SIZE);
+        try (InputStream is = new BufferedInputStream(Files.newInputStream(cacheFile), 1 << 16)) {
+            while (true) {
+                if (cancelRequested) throw new CancellationException("Conversion cancelled");
+                byte[] sb = is.readNBytes(4);
+                if (sb.length < 4) break;
+                int size = readInt4(sb, 0);
+                if (size <= 0) break;
+
+                int myIdx = idx++;
+                String dim = winnerIndexToDim.get(myIdx);
+                if (dim == null) {
+                    skipFully(is, size);
+                    continue;
+                }
+                Long posKey = posByIndex.get(myIdx);
+                if (posKey != null && ctx.isFinal(dim, posKey)) {
+                    skipFully(is, size);
+                    ctx.olderCopiesSkipped.incrementAndGet();
+                    skippedOut[0]++;
+                    continue;
+                }
+
+                byte[] data = is.readNBytes(size);
+                if (data.length < size) break;
+
+                batch.add(new PendingChunk(myIdx, dim, data));
+                if (batch.size() >= BATCH_SIZE) {
+                    sink.accept(batch);
+                    batch = new ArrayList<>(BATCH_SIZE);
+                }
+            }
+        }
+        if (!batch.isEmpty()) sink.accept(batch);
+        nextIndexOut[0] = idx;
     }
 
     private static EncodedChunk encodeChunk(
-            PendingChunk pc,
+            PendingChunk pc, WriteContext ctx,
             net.minecraft.network.codec.StreamCodec<io.netty.buffer.ByteBuf, net.minecraft.network.protocol.Packet<? super net.minecraft.network.protocol.game.ClientGamePacketListener>> codec,
             RegistryAccess registryAccess,
             com.mojang.serialization.DynamicOps<Tag> ops,
@@ -285,11 +384,46 @@ public class FbrWorldConverter {
                 return new EncodedChunk(null, false, null, null, null, null); // not a chunk packet
             }
             pos = new ChunkPos(cp.getX(), cp.getZ());
-            int[] blockCount = new int[1];
-            CompoundTag chunkNbt = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess, pc.dim(), blockCount);
-            hasBlocks = blockCount[0] > 0;
-            byte[] chunkEntry = RegionFileWriter.encode(pos, chunkNbt);
-            byte[] entityEntry = RegionFileWriter.encode(pos, buildEntityChunkNbt(pos));
+
+            byte[] chunkNbtBytes = null;
+            FbrChunkTranslator.Session tr = ctx.translator;
+            if (tr.enabled) {
+                try {
+                    FbrChunkTranslator.Result direct = FbrChunkTranslator.translate(tr, cp, pc.dim());
+                    if (tr.shouldCheck()) {
+                        // Double-check against the old way.
+                        int[] blockCount = new int[1];
+                        CompoundTag original = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess, pc.dim(), blockCount);
+                        byte[] originalBytes = FbrChunkTranslator.nbtBytes(original);
+                        String diff = FbrNbtIO.compareChunks(direct.nbt(), originalBytes);
+                        if (diff != null || direct.hasBlocks() != (blockCount[0] > 0)) {
+                            tr.disable("chunk " + pos.x + "," + pos.z + " differed: "
+                                    + (diff != null ? diff : "block count"));
+                            chunkNbtBytes = originalBytes;
+                            hasBlocks = blockCount[0] > 0;
+                        } else {
+                            tr.checkPassed();
+                        }
+                    }
+                    if (chunkNbtBytes == null) {
+                        chunkNbtBytes = direct.nbt();
+                        hasBlocks = direct.hasBlocks();
+                        tr.noteSuccess();
+                    }
+                } catch (Exception e) {
+                    tr.noteFailure(String.valueOf(e.getMessage()));
+                    chunkNbtBytes = null;
+                }
+            }
+            if (chunkNbtBytes == null) {
+                int[] blockCount = new int[1];
+                CompoundTag chunkNbt = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess, pc.dim(), blockCount);
+                hasBlocks = blockCount[0] > 0;
+                chunkNbtBytes = FbrChunkTranslator.nbtBytes(chunkNbt);
+            }
+
+            byte[] chunkEntry = RegionFileWriter.encodeRaw(pos, chunkNbtBytes, ctx.lz4);
+            byte[] entityEntry = RegionFileWriter.encode(pos, buildEntityChunkNbt(pos), ctx.lz4);
             return new EncodedChunk(pos, hasBlocks, chunkEntry, entityEntry, null, null);
         } catch (Exception e) {
             String msg = String.valueOf(e.getMessage());
@@ -310,10 +444,13 @@ public class FbrWorldConverter {
 
         List<Future<EncodedChunk>> futures = new ArrayList<>(batch.size());
         for (PendingChunk pc : batch) {
-            futures.add(pool.submit(() -> encodeChunk(pc, codec, registryAccess, ops, blockCodec, biomeCodec)));
+            futures.add(pool.submit(() -> encodeChunk(pc, ctx, codec, registryAccess, ops, blockCodec, biomeCodec)));
         }
 
-        // Apply results strictly in recording order (same rules as before).
+        // Apply results in order. Recordings are processed newest first, so:
+        //  - a chunk already written with real blocks is final (older copies are ignored)
+        //  - an air-only chunk is written but stays replaceable by an older copy that has
+        //    blocks (or by an older air-only copy, matching the old "first copy wins" rule)
         for (int i = 0; i < batch.size(); i++) {
             PendingChunk pc = batch.get(i);
             EncodedChunk res;
@@ -337,12 +474,12 @@ public class FbrWorldConverter {
             if (res.pos() == null) continue; // not a chunk packet
 
             ChunkPos pos = res.pos();
-            Map<Long, Boolean> placedInDim = ctx.placed.computeIfAbsent(dim, k -> new HashMap<>());
+            var states = ctx.stateFor(dim);
             long posKey = ChunkPos.asLong(pos.x, pos.z);
-            Boolean alreadyPlaced = placedInDim.get(posKey);
+            Byte state = states.get(posKey);
 
-            if (alreadyPlaced != null && !res.hasBlocks()) {
-                ctx.keptTerrain++;
+            if (state != null && state == 2) {
+                ctx.olderCopiesSkipped.incrementAndGet();
                 continue;
             }
 
@@ -362,8 +499,8 @@ public class FbrWorldConverter {
                             catch (Exception e) { throw new RuntimeException(e); }
                         }).writeEntry(pos, res.entityEntry());
 
-                placedInDim.put(posKey, res.hasBlocks() || Boolean.TRUE.equals(alreadyPlaced));
-                if (alreadyPlaced == null) ctx.written++;
+                states.put(posKey, res.hasBlocks() ? (byte) 2 : (byte) 1);
+                if (state == null) ctx.written++;
                 ctx.writtenPerRecording[r]++;
             } catch (Exception e) {
                 FbrToWorldMod.LOGGER.warn("[FbrToWorld] Skipped {}/idx {} (recording {}): {}",
@@ -402,6 +539,28 @@ public class FbrWorldConverter {
             return;
         }
 
+        if (existingWorldTarget != null && com.moulberry.fbrtoworld.config.FbrSettings.isSkipAdded()) {
+            java.util.Set<String> alreadyAdded = FbrSources.read(existingWorldTarget);
+            List<String> skippedNames = new ArrayList<>();
+            inputs.removeIf(p -> {
+                boolean known = alreadyAdded.contains(FbrSources.key(p));
+                if (known) skippedNames.add(p.getFileName().toString());
+                return known;
+            });
+            if (!skippedNames.isEmpty()) {
+                sendMessage(mc, "§7[FbrToWorld] Skipping " + skippedNames.size()
+                        + " recording(s) already in this world: " + String.join(", ", skippedNames));
+            }
+            if (inputs.isEmpty()) {
+                String msg = "Nothing new to add - every recording is already in " + existingWorldTarget.getFileName();
+                sendMessage(mc, "§a[FbrToWorld] " + msg);
+                progressWorldName = existingWorldTarget.getFileName().toString();
+                progressResultMessage = msg;
+                progressDone = true;
+                return;
+            }
+        }
+
         final int recordingCount = inputs.size();
         progressRecordingCount = recordingCount;
 
@@ -422,12 +581,35 @@ public class FbrWorldConverter {
         sendMessage(mc, "§a[FbrToWorld] Phase 1/3 & 2/3: Indexing chunks and scanning timelines...");
 
         List<Map<String, Map<Long, Integer>>> scans = new ArrayList<>();
+        List<int[]> cacheCountsPerRecording = new ArrayList<>();
+        int reusedScans = 0;
         for (int r = 0; r < recordingCount; r++) {
             checkCancelled();
             progressRecording = r + 1;
-            progressRecordingName = inputs.get(r).getFileName().toString();
-            scans.add(FbrStartSpawn.scanRecording(inputs.get(r), r, recordingCount,
-                    gamePacketCodec, registryAccess, mc));
+            Path recording = inputs.get(r);
+            progressRecordingName = recording.getFileName().toString();
+
+            // Remember scans: a recording scanned before (same file, unchanged) skips scanning.
+            FbrScanCache.Entry saved = FbrScanCache.load(recording);
+            if (saved != null) {
+                if (r == 0) FbrStartSpawn.capture(recording, gamePacketCodec, registryAccess);
+                setActionBar(mc, "Using saved scan" + (recordingCount > 1 ? " [" + (r + 1) + "/" + recordingCount + "]" : ""),
+                        r + 1, recordingCount);
+                scans.add(saved.scan());
+                cacheCountsPerRecording.add(saved.cacheFileCounts());
+                reusedScans++;
+                continue;
+            }
+
+            Map<String, Map<Long, Integer>> scan = FbrStartSpawn.scanRecording(recording, r, recordingCount,
+                    gamePacketCodec, registryAccess, mc);
+            int[] counts = LAST_CACHE_COUNTS.remove(recording);
+            scans.add(scan);
+            cacheCountsPerRecording.add(counts);
+            if (counts != null && !scan.isEmpty()) FbrScanCache.save(recording, scan, counts);
+        }
+        if (reusedScans > 0) {
+            sendMessage(mc, "§7[FbrToWorld] Reused saved scans for " + reusedScans + " recording(s) - no rescanning needed.");
         }
 
         Map<String, Set<Long>> merged = new LinkedHashMap<>();
@@ -459,14 +641,18 @@ public class FbrWorldConverter {
         }
 
         List<Map<Integer, String>> candidatesPerRecording = new ArrayList<>();
+        List<Map<Integer, Long>> positionsPerRecording = new ArrayList<>();
         for (int r = 0; r < recordingCount; r++) {
             Map<Integer, String> byIndex = new HashMap<>();
+            Map<Integer, Long> posByIndex = new HashMap<>();
             for (var dimEntry : scans.get(r).entrySet()) {
-                for (int chunkIndex : dimEntry.getValue().values()) {
-                    byIndex.put(chunkIndex, dimEntry.getKey());
+                for (var e : dimEntry.getValue().entrySet()) {
+                    byIndex.put(e.getValue(), dimEntry.getKey());
+                    posByIndex.put(e.getValue(), e.getKey());
                 }
             }
             candidatesPerRecording.add(byIndex);
+            positionsPerRecording.add(posByIndex);
         }
 
         if (recordingCount > 1) {
@@ -526,6 +712,11 @@ public class FbrWorldConverter {
             if (recordingCount > 1) {
                 baseName = baseName + " +" + (recordingCount - 1);
             }
+            String customFolder = safeFolderName(activeWorldName);
+            if (customFolder != null) {
+                baseName = customFolder;
+                sendMessage(mc, "§7[FbrToWorld] World name: " + activeWorldName);
+            }
             Path savesDir = mc.gameDirectory.toPath().resolve("saves");
             worldPath = savesDir.resolve(baseName);
             if (Files.exists(worldPath)) {
@@ -565,76 +756,121 @@ public class FbrWorldConverter {
 
         Map<String, Map<Long, RegionFileWriter>> regionWriters = new HashMap<>();
         Map<String, Map<Long, RegionFileWriter>> entityWriters = new HashMap<>();
-        int written = 0, skipped = 0, keptTerrain = 0;
+        int written = 0, skipped = 0;
         int[] writtenPerRecording = new int[recordingCount];
         int[] skippedPerRecording = new int[recordingCount];
-        int processed = 0;
+        final int progressTotalChunks = scannedTotal;
 
-        Map<String, Map<Long, Boolean>> placed = new HashMap<>();
-
-        // Faster Convert: decoding, building and compressing chunks runs on several threads;
-        // the results are then written to the region files in the original order, so overlap
-        // rules (later recordings win, air-only copies don't erase terrain) are unchanged.
+        // Faster Convert: newest recording first. Once a chunk with real blocks is written,
+        // older copies of it are skipped without even being decoded. End result is the same
+        // as before: later recordings win, and an air-only copy never erases real terrain.
         int threads = workerThreadCount();
         progressThreads = threads;
         ExecutorService pool = newWorkerPool(threads);
-        WriteContext ctx = new WriteContext(recordingCount, dimPaths, regionWriters, entityWriters, placed);
-        sendMessage(mc, "§7[FbrToWorld] Fast convert: using " + threads + " CPU thread(s).");
+        ExecutorService readerPool = newWorkerPool(READ_AHEAD);
+        boolean lz4 = com.moulberry.fbrtoworld.config.FbrSettings.isLz4() && RegionFileWriter.lz4Available();
+        FbrChunkTranslator.Session translator = new FbrChunkTranslator.Session(
+                registryAccess, ops, blockCodec, biomeCodec, DATA_VERSION);
+        WriteContext ctx = new WriteContext(recordingCount, dimPaths, regionWriters, entityWriters, translator, lz4);
+        sendMessage(mc, "§7[FbrToWorld] Fast convert: " + threads + " CPU thread(s)"
+                + (lz4 ? ", LZ4 compression" : "")
+                + (recordingCount > 1 ? ", newest recording first" : "") + ".");
 
         try {
-            for (int r = 0; r < recordingCount; r++) {
+            for (int r = recordingCount - 1; r >= 0; r--) {
                 checkCancelled();
                 Map<Integer, String> winnerIndexToDim = candidatesPerRecording.get(r);
                 if (winnerIndexToDim.isEmpty()) continue;
+                Map<Integer, Long> posByIndex = positionsPerRecording.get(r);
 
                 progressRecording = r + 1;
                 progressRecordingName = inputs.get(r).getFileName().toString();
                 String tag = recordingCount > 1 ? " [" + (r + 1) + "/" + recordingCount + "]" : "";
-                List<PendingChunk> batch = new ArrayList<>(BATCH_SIZE);
+                final int rec = r;
 
                 try (FileSystem zip = FileSystems.newFileSystem(inputs.get(r))) {
                     List<Path> cacheFiles = listCacheFiles(zip);
-                    int globalIndex = 0;
+                    int[] counts = cacheCountsPerRecording.get(r);
+                    int[] starts = null;
+                    if (counts != null && counts.length == cacheFiles.size()) {
+                        starts = new int[counts.length];
+                        for (int f = 1; f < counts.length; f++) starts[f] = starts[f - 1] + counts[f - 1];
+                    }
 
-                    for (Path cacheFile : cacheFiles) {
-                        try (InputStream is = new BufferedInputStream(Files.newInputStream(cacheFile), 1 << 16)) {
-                            while (true) {
-                                byte[] sb = is.readNBytes(4);
-                                if (sb.length < 4) break;
-                                int size = readInt4(sb, 0);
-                                if (size <= 0) break;
-
-                                int idx = globalIndex++;
-                                String dim = winnerIndexToDim.get(idx);
-
-                                if (dim == null) {
-                                    skipFully(is, size);
-                                    continue;
-                                }
-
-                                if (processed % 16 == 0) {
-                                    checkCancelled();
-                                    String shortDim = dim.contains(":") ? dim.split(":")[1] : dim;
-                                    setActionBar(mc, "Writing " + shortDim + tag, processed, scannedTotal);
-                                }
-                                processed++;
-
-                                byte[] data = is.readNBytes(size);
-                                if (data.length < size) break;
-
-                                batch.add(new PendingChunk(idx, dim, data));
-                                if (batch.size() >= BATCH_SIZE) {
-                                    flushBatch(batch, r, pool, ctx, gamePacketCodec, registryAccess, ops, blockCodec, biomeCodec);
-                                    batch.clear();
-                                }
+                    if (starts == null) {
+                        // Entry counts unknown: read the cache files one after another.
+                        int[] nextIndex = {0};
+                        for (Path cacheFile : cacheFiles) {
+                            checkCancelled();
+                            int[] skippedHere = new int[1];
+                            readCacheFile(cacheFile, nextIndex[0], winnerIndexToDim, posByIndex, ctx,
+                                    batch -> {
+                                        flushBatch(batch, rec, pool, ctx, gamePacketCodec, registryAccess, ops, blockCodec, biomeCodec);
+                                        ctx.processed += batch.size();
+                                        setActionBar(mc, "Writing" + tag, ctx.processed, progressTotalChunks);
+                                    }, skippedHere, nextIndex);
+                            ctx.processed += skippedHere[0];
+                        }
+                    } else {
+                        // Unzip several cache files at once (each on its own thread), but hand
+                        // their chunks to the writer strictly in order.
+                        int n = cacheFiles.size();
+                        List<java.util.concurrent.BlockingQueue<Object>> queues = new ArrayList<>(n);
+                        for (int f = 0; f < n; f++) queues.add(new java.util.concurrent.ArrayBlockingQueue<>(3));
+                        int started = 0;
+                        for (int f = 0; f < n; f++) {
+                            while (started < n && started < f + READ_AHEAD) {
+                                final int file = started;
+                                final int startIndex = starts[file];
+                                final var queue = queues.get(file);
+                                readerPool.submit(() -> {
+                                    int[] skippedHere = new int[1];
+                                    try {
+                                        readCacheFile(cacheFiles.get(file), startIndex, winnerIndexToDim, posByIndex, ctx,
+                                                queue::put, skippedHere, new int[1]);
+                                        queue.put(new ReaderDone(skippedHere[0]));
+                                    } catch (InterruptedException e) {
+                                        Thread.currentThread().interrupt();
+                                    } catch (Throwable t) {
+                                        try { queue.put(t); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+                                    }
+                                    return null;
+                                });
+                                started++;
                             }
+                            var queue = queues.get(f);
+                            while (true) {
+                                Object item;
+                                try {
+                                    item = queue.poll(250, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                    throw new CancellationException("Conversion cancelled");
+                                }
+                                if (item == null) { checkCancelled(); continue; }
+                                if (item instanceof ReaderDone done) {
+                                    ctx.processed += done.skipped();
+                                    break;
+                                }
+                                if (item instanceof Throwable t) {
+                                    if (t instanceof Exception ex) throw ex;
+                                    throw new RuntimeException(t);
+                                }
+                                @SuppressWarnings("unchecked")
+                                List<PendingChunk> batch = (List<PendingChunk>) item;
+                                checkCancelled();
+                                flushBatch(batch, rec, pool, ctx, gamePacketCodec, registryAccess, ops, blockCodec, biomeCodec);
+                                ctx.processed += batch.size();
+                                String shortDim = batch.get(0).dim().contains(":") ? batch.get(0).dim().split(":")[1] : batch.get(0).dim();
+                                setActionBar(mc, "Writing " + shortDim + tag, ctx.processed, progressTotalChunks);
+                            }
+                            queues.set(f, null);
                         }
                     }
                 }
-                flushBatch(batch, r, pool, ctx, gamePacketCodec, registryAccess, ops, blockCodec, biomeCodec);
-                batch.clear();
             }
         } finally {
+            readerPool.shutdownNow();
             pool.shutdownNow();
             for (var m : regionWriters.values()) for (var w : m.values()) closeQuietly(w);
             for (var m : entityWriters.values()) for (var w : m.values()) closeQuietly(w);
@@ -642,7 +878,6 @@ public class FbrWorldConverter {
 
         written = ctx.written;
         skipped = ctx.skipped;
-        keptTerrain = ctx.keptTerrain;
         writtenPerRecording = ctx.writtenPerRecording;
         skippedPerRecording = ctx.skippedPerRecording;
 
@@ -672,15 +907,23 @@ public class FbrWorldConverter {
             }
         }
 
-        if (keptTerrain > 0) {
-            sendMessage(mc, "§7[FbrToWorld] " + keptTerrain
-                    + " air-only copies skipped so existing terrain wasn't erased.");
-            FbrToWorldMod.LOGGER.info("[FbrToWorld] {} air-only chunk copies skipped", keptTerrain);
+        if (ctx.olderCopiesSkipped.get() > 0) {
+            sendMessage(mc, "§7[FbrToWorld] " + ctx.olderCopiesSkipped.get()
+                    + " older chunk copies skipped without decoding (a newer recording already had them).");
+        }
+        if (translator.enabled) {
+            sendMessage(mc, "§7[FbrToWorld] Direct chunk translation: " + translator.translated.get() + " chunks ("
+                    + translator.checksPassed.get() + " double-checked against the old method"
+                    + (translator.fellBack.get() > 0 ? ", " + translator.fellBack.get() + " done the old way" : "") + ").");
+        } else {
+            sendMessage(mc, "§e[FbrToWorld] Direct chunk translation switched itself off (" + translator.disabledReason
+                    + ") - those chunks were converted the old, safe way.");
         }
 
         if (!importMode) {
-            FbrStartSpawn.writeLevelDat(worldPath, worldPath.getFileName().toString());
+            FbrStartSpawn.writeLevelDat(worldPath, levelNameFor(worldPath));
         }
+        FbrSources.append(worldPath, inputs);
 
         String resultMsg = written + " chunks written"
                 + (skipped > 0 ? " (" + skipped + " skipped)" : "")
@@ -737,35 +980,37 @@ public class FbrWorldConverter {
 
             Map<Integer, int[]> indexToXZ = new HashMap<>();
             int totalPackets = 0;
-            byte[] headBuf = new byte[16];
+            int[] entriesPerFile = new int[totalCacheFiles];
 
-            for (int cfi = 0; cfi < totalCacheFiles; cfi++) {
-                checkCancelled();
-                setActionBar(mc, "Indexing cache" + tag, cfi + 1, totalCacheFiles);
-                try (InputStream is = new BufferedInputStream(Files.newInputStream(cacheFiles.get(cfi)), 1 << 16)) {
-                    while (true) {
-                        byte[] sb = is.readNBytes(4);
-                        if (sb.length < 4) break;
-                        int size = readInt4(sb, 0);
-                        if (size <= 0) break;
-
-                        int headLen = Math.min(size, 16);
-                        int got = is.readNBytes(headBuf, 0, headLen);
-                        if (got < headLen) break;
-
-                        skipFully(is, size - headLen);
-
-                        int vi = varIntLength(headBuf, got);
-                        if (got >= vi + 8) {
-                            indexToXZ.put(totalPackets, new int[]{
-                                readInt4(headBuf, vi),
-                                readInt4(headBuf, vi + 4)
-                            });
-                        }
+            // Faster Convert: unzip the cache files in parallel, then join the results in order.
+            ExecutorService indexPool = newWorkerPool(Math.max(1, Math.min(workerThreadCount(), totalCacheFiles)));
+            try {
+                List<Future<long[]>> indexed = new ArrayList<>(totalCacheFiles);
+                for (Path cacheFile : cacheFiles) indexed.add(indexPool.submit(() -> indexCacheFile(cacheFile)));
+                for (int cfi = 0; cfi < totalCacheFiles; cfi++) {
+                    checkCancelled();
+                    long[] entries;
+                    try {
+                        entries = indexed.get(cfi).get();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new CancellationException("Conversion cancelled");
+                    } catch (ExecutionException e) {
+                        Throwable cause = e.getCause();
+                        if (cause instanceof Exception ex) throw ex;
+                        throw new RuntimeException(cause);
+                    }
+                    setActionBar(mc, "Indexing cache" + tag, cfi + 1, totalCacheFiles);
+                    entriesPerFile[cfi] = entries.length;
+                    for (long xz : entries) {
+                        if (xz != NO_XZ) indexToXZ.put(totalPackets, new int[]{(int) (xz >> 32), (int) xz});
                         totalPackets++;
                     }
                 }
+            } finally {
+                indexPool.shutdownNow();
             }
+            LAST_CACHE_COUNTS.put(fbrPath, entriesPerFile);
 
             FbrToWorldMod.LOGGER.info("[FbrToWorld] {}: indexed {} of {} cache entries",
                     fbrPath.getFileName(), indexToXZ.size(), totalPackets);
@@ -812,6 +1057,42 @@ public class FbrWorldConverter {
         }
 
         return dimPosToWinnerIndex;
+    }
+
+    private static final long NO_XZ = Long.MIN_VALUE;
+
+    /** Per recording: how many entries each cache file had (from the last scan). Used to read cache files in parallel. */
+    static final Map<Path, int[]> LAST_CACHE_COUNTS = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Reads the X/Z of every entry in one cache file (NO_XZ where it can't be read). */
+    private static long[] indexCacheFile(Path cacheFile) throws IOException {
+        long[] out = new long[1024];
+        int n = 0;
+        byte[] headBuf = new byte[16];
+        try (InputStream is = new BufferedInputStream(Files.newInputStream(cacheFile), 1 << 16)) {
+            while (true) {
+                if (cancelRequested) throw new CancellationException("Conversion cancelled");
+                byte[] sb = is.readNBytes(4);
+                if (sb.length < 4) break;
+                int size = readInt4(sb, 0);
+                if (size <= 0) break;
+
+                int headLen = Math.min(size, 16);
+                int got = is.readNBytes(headBuf, 0, headLen);
+                if (got < headLen) break;
+
+                skipFully(is, size - headLen);
+
+                int vi = varIntLength(headBuf, got);
+                long value = NO_XZ;
+                if (got >= vi + 8) {
+                    value = ((long) readInt4(headBuf, vi) << 32) | (readInt4(headBuf, vi + 4) & 0xFFFFFFFFL);
+                }
+                if (n == out.length) out = Arrays.copyOf(out, n * 2);
+                out[n++] = value;
+            }
+        }
+        return Arrays.copyOf(out, n);
     }
 
     private static List<Path> listCacheFiles(FileSystem zip) throws IOException {
