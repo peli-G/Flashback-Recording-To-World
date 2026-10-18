@@ -27,6 +27,14 @@ public final class FbrConversionLauncher {
     }
 
     private static void start(Minecraft minecraft, Screen previousScreen, List<Path> recordings, Path targetWorld) {
+        FbrBackgroundOverlay.ensureRegistered();
+        if (FbrWorldConverter.running) {
+            // One conversion at a time - show the one that's already going.
+            minecraft.setScreen(new FbrConvertProgressScreen(previousScreen));
+            return;
+        }
+        FbrBackgroundOverlay.resetForNewConversion();
+
         List<Path> paths = new ArrayList<>(recordings);
         if (paths.isEmpty()) {
             FbrToWorldMod.LOGGER.warn("[FbrToWorld] Convert requested with no recordings selected");

@@ -37,10 +37,14 @@ public class RegionFileWriter implements Closeable {
     }
 
     public void write(ChunkPos pos, CompoundTag nbt) throws IOException {
-        if (this.finished) throw new IOException("Region file already closed: " + this.path);
+        this.writeEntry(pos, encode(pos, nbt));
+    }
 
-        int index = (pos.x & 31) + (pos.z & 31) * 32;
-
+    /**
+     * Compresses a chunk into the exact bytes stored in a region file. Pure work with no shared
+     * state, so Faster Convert runs this on several threads at once.
+     */
+    public static byte[] encode(ChunkPos pos, CompoundTag nbt) throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         try (DataOutputStream dos = new DataOutputStream(new DeflaterOutputStream(baos))) {
             NbtIo.write(nbt, (DataOutput) dos);
@@ -63,6 +67,15 @@ public class RegionFileWriter implements Closeable {
             throw new IOException("Chunk " + pos.x + "," + pos.z
                     + " is too large for the region format (" + entry.length + " bytes)");
         }
+        return entry;
+    }
+
+    /** Writes bytes made by {@link #encode}. Region files are written from one thread only. */
+    public void writeEntry(ChunkPos pos, byte[] entry) throws IOException {
+        if (this.finished) throw new IOException("Region file already closed: " + this.path);
+
+        int index = (pos.x & 31) + (pos.z & 31) * 32;
+        int sectors = (entry.length + SECTOR_SIZE - 1) / SECTOR_SIZE;
 
         this.ensureOpen();
         this.raf.seek((long) this.nextSector * SECTOR_SIZE);

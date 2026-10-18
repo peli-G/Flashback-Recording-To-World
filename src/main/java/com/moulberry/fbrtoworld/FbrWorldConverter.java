@@ -1,6 +1,10 @@
 package com.moulberry.fbrtoworld;
 
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import io.netty.buffer.Unpooled;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.Holder;
@@ -48,6 +52,8 @@ public class FbrWorldConverter {
     public static volatile int progressRecording = 0;
     public static volatile int progressRecordingCount = 0;
     public static volatile String progressRecordingName = "";
+
+    public static volatile int progressThreads = 1;
 
     public static volatile Path progressWorldPath = null;
     public static volatile Path progressStagingPath = null;
@@ -100,6 +106,7 @@ public class FbrWorldConverter {
         progressRecording = 0;
         progressRecordingCount = inputs.size();
         progressRecordingName = "";
+        progressThreads = 1;
         Thread t = new Thread(() -> {
             try {
                 FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion thread started for {}", inputs);
@@ -121,6 +128,7 @@ public class FbrWorldConverter {
                 } else {
                     FbrToWorldMod.LOGGER.error("[FbrToWorld] Conversion failed", e);
                     clearActionBar(mc);
+                    writeLevelDatIfMissing(mc, importMode);
                     sendMessage(mc, "§c[FbrToWorld] Failed: " + e.getMessage() + " — see log.");
                     progressFailed = true;
                     progressResultMessage = "Failed: " + e.getMessage();
@@ -136,6 +144,18 @@ public class FbrWorldConverter {
         t.start();
         FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion thread launched, start() returning true");
         return true;
+    }
+
+    /** After a failure the new world's level.dat may not exist yet - write it so the partial world can still be opened. */
+    private static void writeLevelDatIfMissing(Minecraft mc, boolean importMode) {
+        Path world = progressWorldPath;
+        if (importMode || world == null || Files.exists(world.resolve("level.dat"))) return;
+        try {
+            writeLevelDat(world, world.getFileName().toString());
+            FbrStartSpawn.apply(world, mc);
+        } catch (Exception ex) {
+            FbrToWorldMod.LOGGER.warn("[FbrToWorld] Couldn't write level.dat for the partial world: {}", ex.getMessage());
+        }
     }
 
     private static void cleanupAfterCancel(Minecraft mc, boolean importMode) {
@@ -167,11 +187,189 @@ public class FbrWorldConverter {
     private static void mergeRegionDir(Path stagedDir, Path realDir) throws IOException {
         if (!Files.isDirectory(stagedDir)) return;
         Files.createDirectories(realDir);
+        List<Path> stagedFiles = new ArrayList<>();
         try (var files = Files.list(stagedDir)) {
             for (Path staged : (Iterable<Path>) files::iterator) {
-                if (!staged.getFileName().toString().endsWith(".mca")) continue;
+                if (staged.getFileName().toString().endsWith(".mca")) stagedFiles.add(staged);
+            }
+        }
+        // Each region file is independent, so they're merged in parallel (Faster Convert).
+        ExecutorService pool = newWorkerPool(workerThreadCount());
+        try {
+            List<Future<?>> jobs = new ArrayList<>();
+            for (Path staged : stagedFiles) {
                 Path real = realDir.resolve(staged.getFileName().toString());
-                RegionFileMerger.mergeInto(staged, real);
+                jobs.add(pool.submit(() -> {
+                    RegionFileMerger.mergeInto(staged, real);
+                    return null;
+                }));
+            }
+            for (Future<?> job : jobs) {
+                checkCancelled();
+                try {
+                    job.get();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new CancellationException("Conversion cancelled");
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause();
+                    if (cause instanceof IOException io) throw io;
+                    throw new IOException(cause);
+                }
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private static final int BATCH_SIZE = 256;
+
+    /** Leave one core for the game itself; cap so a huge CPU doesn't eat all the RAM with in-flight chunks. */
+    private static int workerThreadCount() {
+        int cores = Runtime.getRuntime().availableProcessors();
+        return Math.max(1, Math.min(8, cores - 1));
+    }
+
+    private static ExecutorService newWorkerPool(int threads) {
+        java.util.concurrent.atomic.AtomicInteger n = new java.util.concurrent.atomic.AtomicInteger();
+        return Executors.newFixedThreadPool(threads, runnable -> {
+            Thread t = new Thread(runnable, "fbr-to-world-worker-" + n.incrementAndGet());
+            t.setDaemon(true);
+            t.setPriority(Thread.NORM_PRIORITY - 1);
+            return t;
+        });
+    }
+
+    private record PendingChunk(int index, String dim, byte[] data) {}
+
+    /** Result of decoding/building/compressing one chunk on a worker thread. */
+    private record EncodedChunk(ChunkPos pos, boolean hasBlocks, byte[] chunkEntry, byte[] entityEntry,
+                                String decodeError, String encodeError) {}
+
+    /** Write-phase state; only touched from the conversion thread. */
+    private static final class WriteContext {
+        final Map<String, Path> dimPaths;
+        final Map<String, Map<Long, RegionFileWriter>> regionWriters;
+        final Map<String, Map<Long, RegionFileWriter>> entityWriters;
+        final Map<String, Map<Long, Boolean>> placed;
+        final int[] writtenPerRecording;
+        final int[] skippedPerRecording;
+        int written, skipped, keptTerrain;
+
+        WriteContext(int recordingCount, Map<String, Path> dimPaths,
+                     Map<String, Map<Long, RegionFileWriter>> regionWriters,
+                     Map<String, Map<Long, RegionFileWriter>> entityWriters,
+                     Map<String, Map<Long, Boolean>> placed) {
+            this.dimPaths = dimPaths;
+            this.regionWriters = regionWriters;
+            this.entityWriters = entityWriters;
+            this.placed = placed;
+            this.writtenPerRecording = new int[recordingCount];
+            this.skippedPerRecording = new int[recordingCount];
+        }
+    }
+
+    private static EncodedChunk encodeChunk(
+            PendingChunk pc,
+            net.minecraft.network.codec.StreamCodec<io.netty.buffer.ByteBuf, net.minecraft.network.protocol.Packet<? super net.minecraft.network.protocol.game.ClientGamePacketListener>> codec,
+            RegistryAccess registryAccess,
+            com.mojang.serialization.DynamicOps<Tag> ops,
+            com.mojang.serialization.Codec<PalettedContainer<BlockState>> blockCodec,
+            com.mojang.serialization.Codec<PalettedContainerRO<Holder<Biome>>> biomeCodec) {
+        ChunkPos pos = null;
+        boolean hasBlocks = false;
+        try {
+            var buf = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(pc.data()), registryAccess);
+            var pkt = codec.decode(buf);
+            if (!(pkt instanceof ClientboundLevelChunkWithLightPacket cp)) {
+                return new EncodedChunk(null, false, null, null, null, null); // not a chunk packet
+            }
+            pos = new ChunkPos(cp.getX(), cp.getZ());
+            int[] blockCount = new int[1];
+            CompoundTag chunkNbt = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess, pc.dim(), blockCount);
+            hasBlocks = blockCount[0] > 0;
+            byte[] chunkEntry = RegionFileWriter.encode(pos, chunkNbt);
+            byte[] entityEntry = RegionFileWriter.encode(pos, buildEntityChunkNbt(pos));
+            return new EncodedChunk(pos, hasBlocks, chunkEntry, entityEntry, null, null);
+        } catch (Exception e) {
+            String msg = String.valueOf(e.getMessage());
+            return pos == null
+                    ? new EncodedChunk(null, false, null, null, msg, null)
+                    : new EncodedChunk(pos, hasBlocks, null, null, null, msg);
+        }
+    }
+
+    private static void flushBatch(
+            List<PendingChunk> batch, int r, ExecutorService pool, WriteContext ctx,
+            net.minecraft.network.codec.StreamCodec<io.netty.buffer.ByteBuf, net.minecraft.network.protocol.Packet<? super net.minecraft.network.protocol.game.ClientGamePacketListener>> codec,
+            RegistryAccess registryAccess,
+            com.mojang.serialization.DynamicOps<Tag> ops,
+            com.mojang.serialization.Codec<PalettedContainer<BlockState>> blockCodec,
+            com.mojang.serialization.Codec<PalettedContainerRO<Holder<Biome>>> biomeCodec) throws Exception {
+        if (batch.isEmpty()) return;
+
+        List<Future<EncodedChunk>> futures = new ArrayList<>(batch.size());
+        for (PendingChunk pc : batch) {
+            futures.add(pool.submit(() -> encodeChunk(pc, codec, registryAccess, ops, blockCodec, biomeCodec)));
+        }
+
+        // Apply results strictly in recording order (same rules as before).
+        for (int i = 0; i < batch.size(); i++) {
+            PendingChunk pc = batch.get(i);
+            EncodedChunk res;
+            try {
+                res = futures.get(i).get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new CancellationException("Conversion cancelled");
+            } catch (ExecutionException e) {
+                res = new EncodedChunk(null, false, null, null, String.valueOf(e.getCause()), null);
+            }
+
+            String dim = pc.dim();
+            if (res.decodeError() != null) {
+                FbrToWorldMod.LOGGER.warn("[FbrToWorld] Skipped {}/idx {} (recording {}): {}",
+                        dim, pc.index(), r + 1, res.decodeError());
+                ctx.skipped++;
+                ctx.skippedPerRecording[r]++;
+                continue;
+            }
+            if (res.pos() == null) continue; // not a chunk packet
+
+            ChunkPos pos = res.pos();
+            Map<Long, Boolean> placedInDim = ctx.placed.computeIfAbsent(dim, k -> new HashMap<>());
+            long posKey = ChunkPos.asLong(pos.x, pos.z);
+            Boolean alreadyPlaced = placedInDim.get(posKey);
+
+            if (alreadyPlaced != null && !res.hasBlocks()) {
+                ctx.keptTerrain++;
+                continue;
+            }
+
+            try {
+                if (res.encodeError() != null) throw new IOException(res.encodeError());
+                long regionKey = ChunkPos.asLong(pos.getRegionX(), pos.getRegionZ());
+                String regionName = "r." + pos.getRegionX() + "." + pos.getRegionZ() + ".mca";
+                final Path dPath = ctx.dimPaths.get(dim);
+                ctx.regionWriters.computeIfAbsent(dim, k -> new HashMap<>())
+                        .computeIfAbsent(regionKey, k -> {
+                            try { return new RegionFileWriter(dPath.resolve("region").resolve(regionName)); }
+                            catch (Exception e) { throw new RuntimeException(e); }
+                        }).writeEntry(pos, res.chunkEntry());
+                ctx.entityWriters.computeIfAbsent(dim, k -> new HashMap<>())
+                        .computeIfAbsent(regionKey, k -> {
+                            try { return new RegionFileWriter(dPath.resolve("entities").resolve(regionName)); }
+                            catch (Exception e) { throw new RuntimeException(e); }
+                        }).writeEntry(pos, res.entityEntry());
+
+                placedInDim.put(posKey, res.hasBlocks() || Boolean.TRUE.equals(alreadyPlaced));
+                if (alreadyPlaced == null) ctx.written++;
+                ctx.writtenPerRecording[r]++;
+            } catch (Exception e) {
+                FbrToWorldMod.LOGGER.warn("[FbrToWorld] Skipped {}/idx {} (recording {}): {}",
+                        dim, pc.index(), r + 1, e.getMessage());
+                ctx.skipped++;
+                ctx.skippedPerRecording[r]++;
             }
         }
     }
@@ -228,7 +426,7 @@ public class FbrWorldConverter {
             checkCancelled();
             progressRecording = r + 1;
             progressRecordingName = inputs.get(r).getFileName().toString();
-            scans.add(scanRecording(inputs.get(r), r, recordingCount,
+            scans.add(FbrStartSpawn.scanRecording(inputs.get(r), r, recordingCount,
                     gamePacketCodec, registryAccess, mc));
         }
 
@@ -338,7 +536,8 @@ public class FbrWorldConverter {
             Files.createDirectories(worldPath);
             progressWorldPath = worldPath;
             progressWorldName = worldPath.getFileName().toString();
-            writeLevelDat(worldPath, worldPath.getFileName().toString());
+            // level.dat is written once all chunks are in (see below), so the half-made world
+            // doesn't show up in Singleplayer while it's still converting.
         }
 
         var biomeRegistry = registryAccess.lookupOrThrow(Registries.BIOME);
@@ -373,6 +572,15 @@ public class FbrWorldConverter {
 
         Map<String, Map<Long, Boolean>> placed = new HashMap<>();
 
+        // Faster Convert: decoding, building and compressing chunks runs on several threads;
+        // the results are then written to the region files in the original order, so overlap
+        // rules (later recordings win, air-only copies don't erase terrain) are unchanged.
+        int threads = workerThreadCount();
+        progressThreads = threads;
+        ExecutorService pool = newWorkerPool(threads);
+        WriteContext ctx = new WriteContext(recordingCount, dimPaths, regionWriters, entityWriters, placed);
+        sendMessage(mc, "§7[FbrToWorld] Fast convert: using " + threads + " CPU thread(s).");
+
         try {
             for (int r = 0; r < recordingCount; r++) {
                 checkCancelled();
@@ -382,13 +590,14 @@ public class FbrWorldConverter {
                 progressRecording = r + 1;
                 progressRecordingName = inputs.get(r).getFileName().toString();
                 String tag = recordingCount > 1 ? " [" + (r + 1) + "/" + recordingCount + "]" : "";
+                List<PendingChunk> batch = new ArrayList<>(BATCH_SIZE);
 
                 try (FileSystem zip = FileSystems.newFileSystem(inputs.get(r))) {
                     List<Path> cacheFiles = listCacheFiles(zip);
                     int globalIndex = 0;
 
                     for (Path cacheFile : cacheFiles) {
-                        try (InputStream is = Files.newInputStream(cacheFile)) {
+                        try (InputStream is = new BufferedInputStream(Files.newInputStream(cacheFile), 1 << 16)) {
                             while (true) {
                                 byte[] sb = is.readNBytes(4);
                                 if (sb.length < 4) break;
@@ -413,63 +622,29 @@ public class FbrWorldConverter {
                                 byte[] data = is.readNBytes(size);
                                 if (data.length < size) break;
 
-                                var buf = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(data), registryAccess);
-                                try {
-                                    var pkt = gamePacketCodec.decode(buf);
-                                    if (pkt instanceof ClientboundLevelChunkWithLightPacket cp) {
-                                        ChunkPos pos      = new ChunkPos(cp.getX(), cp.getZ());
-                                        long regionKey    = ChunkPos.asLong(pos.getRegionX(), pos.getRegionZ());
-                                        String regionName = "r." + pos.getRegionX() + "." + pos.getRegionZ() + ".mca";
-                                        Path dimPath      = dimPaths.get(dim);
-
-                                        int[] blockCount = new int[1];
-                                        CompoundTag chunkNbt  = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess, dim, blockCount);
-                                        boolean hasBlocks = blockCount[0] > 0;
-
-                                        Map<Long, Boolean> placedInDim = placed.computeIfAbsent(dim, k -> new HashMap<>());
-                                        long posKey = ChunkPos.asLong(pos.x, pos.z);
-                                        Boolean alreadyPlaced = placedInDim.get(posKey);
-
-                                        if (alreadyPlaced != null && !hasBlocks) {
-
-                                            keptTerrain++;
-                                            continue;
-                                        }
-
-                                        CompoundTag entityNbt = buildEntityChunkNbt(pos);
-
-                                        final Path dPath  = dimPath;
-                                        final String fDim = dim;
-                                        regionWriters.computeIfAbsent(fDim, k -> new HashMap<>())
-                                                .computeIfAbsent(regionKey, k -> {
-                                                    try { return new RegionFileWriter(dPath.resolve("region").resolve(regionName)); }
-                                                    catch (Exception e) { throw new RuntimeException(e); }
-                                                }).write(pos, chunkNbt);
-                                        entityWriters.computeIfAbsent(fDim, k -> new HashMap<>())
-                                                .computeIfAbsent(regionKey, k -> {
-                                                    try { return new RegionFileWriter(dPath.resolve("entities").resolve(regionName)); }
-                                                    catch (Exception e) { throw new RuntimeException(e); }
-                                                }).write(pos, entityNbt);
-
-                                        placedInDim.put(posKey, hasBlocks || Boolean.TRUE.equals(alreadyPlaced));
-                                        if (alreadyPlaced == null) written++;
-                                        writtenPerRecording[r]++;
-                                    }
-                                } catch (Exception e) {
-                                    FbrToWorldMod.LOGGER.warn("[FbrToWorld] Skipped {}/idx {} (recording {}): {}",
-                                            dim, idx, r + 1, e.getMessage());
-                                    skipped++;
-                                    skippedPerRecording[r]++;
+                                batch.add(new PendingChunk(idx, dim, data));
+                                if (batch.size() >= BATCH_SIZE) {
+                                    flushBatch(batch, r, pool, ctx, gamePacketCodec, registryAccess, ops, blockCodec, biomeCodec);
+                                    batch.clear();
                                 }
                             }
                         }
                     }
                 }
+                flushBatch(batch, r, pool, ctx, gamePacketCodec, registryAccess, ops, blockCodec, biomeCodec);
+                batch.clear();
             }
         } finally {
+            pool.shutdownNow();
             for (var m : regionWriters.values()) for (var w : m.values()) closeQuietly(w);
             for (var m : entityWriters.values()) for (var w : m.values()) closeQuietly(w);
         }
+
+        written = ctx.written;
+        skipped = ctx.skipped;
+        keptTerrain = ctx.keptTerrain;
+        writtenPerRecording = ctx.writtenPerRecording;
+        skippedPerRecording = ctx.skippedPerRecording;
 
         clearActionBar(mc);
 
@@ -503,6 +678,10 @@ public class FbrWorldConverter {
             FbrToWorldMod.LOGGER.info("[FbrToWorld] {} air-only chunk copies skipped", keptTerrain);
         }
 
+        if (!importMode) {
+            FbrStartSpawn.writeLevelDat(worldPath, worldPath.getFileName().toString());
+        }
+
         String resultMsg = written + " chunks written"
                 + (skipped > 0 ? " (" + skipped + " skipped)" : "")
                 + " across " + merged.size() + " dimension(s)"
@@ -516,7 +695,16 @@ public class FbrWorldConverter {
         progressDone = true;
     }
 
-    private static Map<String, Map<Long, Integer>> scanRecording(
+    private static int readVarIntBytes(byte[] data) {
+        int value = 0;
+        for (int i = 0, shift = 0; i < data.length && i < 5; i++, shift += 7) {
+            value |= (data[i] & 0x7F) << shift;
+            if ((data[i] & 0x80) == 0) break;
+        }
+        return value;
+    }
+
+    static Map<String, Map<Long, Integer>> scanRecording(
             Path fbrPath,
             int recordingIdx,
             int recordingCount,
@@ -554,7 +742,7 @@ public class FbrWorldConverter {
             for (int cfi = 0; cfi < totalCacheFiles; cfi++) {
                 checkCancelled();
                 setActionBar(mc, "Indexing cache" + tag, cfi + 1, totalCacheFiles);
-                try (InputStream is = Files.newInputStream(cacheFiles.get(cfi))) {
+                try (InputStream is = new BufferedInputStream(Files.newInputStream(cacheFiles.get(cfi)), 1 << 16)) {
                     while (true) {
                         byte[] sb = is.readNBytes(4);
                         if (sb.length < 4) break;
@@ -584,6 +772,9 @@ public class FbrWorldConverter {
 
             String[] currentDim = {"minecraft:overworld"};
             final int MAGIC = 0xD780E884;
+            // Faster Convert: packet types already seen that aren't login/respawn are skipped
+            // instead of fully decoded (a packet id always means the same packet type).
+            boolean[] notDimensionPacket = new boolean[1024];
 
             for (int fbi = 0; fbi < totalFbFiles; fbi++) {
                 checkCancelled();
@@ -612,11 +803,11 @@ public class FbrWorldConverter {
                 FriendlyByteBuf snapBuf = new FriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(snapBytes));
                 scanActions(snapBuf, gamePacketId, chunkCachedId,
                         gamePacketCodec, registryAccess, indexToXZ,
-                        currentDim, dimPosToWinnerIndex);
+                        currentDim, dimPosToWinnerIndex, notDimensionPacket);
 
                 scanActions(fbuf, gamePacketId, chunkCachedId,
                         gamePacketCodec, registryAccess, indexToXZ,
-                        currentDim, dimPosToWinnerIndex);
+                        currentDim, dimPosToWinnerIndex, notDimensionPacket);
             }
         }
 
@@ -669,7 +860,8 @@ public class FbrWorldConverter {
             RegistryAccess registryAccess,
             Map<Integer, int[]> indexToXZ,
             String[] currentDim,
-            Map<String, Map<Long, Integer>> dimPosToWinnerIndex) {
+            Map<String, Map<Long, Integer>> dimPosToWinnerIndex,
+            boolean[] notDimensionPacket) {
 
         while (buf.readableBytes() > 0) {
             int actionId = buf.readVarInt();
@@ -678,12 +870,17 @@ public class FbrWorldConverter {
             if (actionId == gamePacketId) {
                 byte[] actionData = new byte[dataSize];
                 buf.readBytes(actionData);
+                int packetId = readVarIntBytes(actionData);
+                if (packetId >= 0 && packetId < notDimensionPacket.length && notDimensionPacket[packetId]) {
+                    continue;
+                }
                 var actionBuf = new RegistryFriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(actionData), registryAccess);
                 try {
                     var pkt = codec.decode(actionBuf);
                     String dimStr = null;
                     if (pkt instanceof ClientboundLoginPacket   lp) dimStr = lp.commonPlayerSpawnInfo().dimension().toString();
                     else if (pkt instanceof ClientboundRespawnPacket rp) dimStr = rp.commonPlayerSpawnInfo().dimension().toString();
+                    else if (packetId >= 0 && packetId < notDimensionPacket.length) notDimensionPacket[packetId] = true;
                     if (dimStr != null) {
                         int slash = dimStr.indexOf('/');
                         currentDim[0] = slash >= 0
@@ -861,7 +1058,7 @@ public class FbrWorldConverter {
         return chunk;
     }
 
-    private static void writeLevelDat(Path worldFolder, String worldName) throws IOException {
+    static void writeLevelDat(Path worldFolder, String worldName) throws IOException {
         CompoundTag data = new CompoundTag();
         data.putInt("DataVersion",  DATA_VERSION);
         data.putString("LevelName", worldName);
@@ -987,7 +1184,7 @@ public class FbrWorldConverter {
                 ByteBuffer.allocate(8).putLong(System.currentTimeMillis()).array());
     }
 
-    private static void sendMessage(Minecraft mc, String message) {
+    static void sendMessage(Minecraft mc, String message) {
         FbrToWorldMod.LOGGER.info(message);
         mc.execute(() -> {
             if (mc.gui != null) mc.gui.getChat().addMessage(Component.literal(message));
