@@ -10,7 +10,8 @@ The Mod Converts:
 
 Download on [Github](https://github.com/peli-G/Flashback-Recording-To-World) & [Modrinth](https://modrinth.com/mod/fbr-to-world).
 
-> This project contains AI-generated code. 
+> [!NOTE]
+> This project contains AI-generated code. See [AI-USAGE.md](AI-USAGE.md) for more information.
 
 # Gamerule Config
 Press the Gamerule Options to configure your default gamerules for the converted world.
