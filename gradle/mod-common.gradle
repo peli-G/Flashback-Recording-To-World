@@ -1,0 +1,43 @@
+apply plugin: 'java'
+
+version = "${rootProject.property('mod_version')}+${project.property('minecraft_version')}"
+group = rootProject.property('maven_group')
+
+base {
+    archivesName = rootProject.property('archives_base_name')
+}
+
+repositories {
+    maven { name = 'FabricMC'; url = 'https://maven.fabricmc.net/' }
+    mavenCentral()
+}
+
+def javaRelease = Integer.parseInt(project.property('java_release'))
+
+java {
+    sourceCompatibility = JavaVersion.toVersion(javaRelease)
+    targetCompatibility = JavaVersion.toVersion(javaRelease)
+    withSourcesJar()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = javaRelease
+}
+
+sourceSets.main.resources.srcDirs = [rootProject.file('src/main/resources')]
+
+processResources {
+    def tokens = [
+            version          : project.version.toString(),
+            depends_minecraft: project.property('depends_minecraft'),
+            depends_loader   : project.property('depends_loader'),
+            depends_java     : project.property('depends_java'),
+            mixin_compat     : project.property('mixin_compat')
+    ]
+    inputs.properties(tokens)
+    filteringCharset = 'UTF-8'
+    filesMatching(['fabric.mod.json', '*.mixins.json']) {
+        expand tokens
+    }
+}

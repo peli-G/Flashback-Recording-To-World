@@ -68,6 +68,7 @@ public class FbrImportWorldScreen extends Screen {
     public void render(GuiGraphics guiGraphics, int mouseX, int mouseY, float partialTick) {
         super.render(guiGraphics, mouseX, mouseY, partialTick);
         this.searchBox.render(guiGraphics, mouseX, mouseY, partialTick);
+        com.moulberry.fbrtoworld.FbrDiagnostics.drawLabel(guiGraphics, this.font, this.height);
         guiGraphics.drawCenteredString(this.font, this.title, this.width / 2, 8, 0xFFFFFFFF);
     }
 

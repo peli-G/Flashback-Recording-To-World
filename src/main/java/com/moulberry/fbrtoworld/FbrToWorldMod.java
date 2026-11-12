@@ -83,12 +83,12 @@ public class FbrToWorldMod implements ClientModInitializer {
 
         net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents.JOIN.register((handler, sender, client) -> {
             cachedRegistryAccess = handler.registryAccess();
-            LOGGER.info("[FbrToWorld] Cached RegistryAccess on world join (registries: {})",
+            FbrDiagnostics.info("[FbrToWorld] Cached RegistryAccess on world join (registries: {})",
                     cachedRegistryAccess.registries().count());
         });
 
         net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
-            LOGGER.info("[FbrToWorld] World/connection disconnected — cached RegistryAccess from this session is still available for conversion");
+            FbrDiagnostics.info("[FbrToWorld] World/connection disconnected — cached RegistryAccess from this session is still available for conversion");
         });
 
         LOGGER.info("FBR-to-World loaded.");

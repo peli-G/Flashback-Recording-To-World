@@ -1,6 +1,8 @@
 package com.moulberry.fbrtoworld.screen;
 
+import com.moulberry.fbrtoworld.FbrDiagnostics;
 import com.moulberry.fbrtoworld.FbrRegistryLoader;
+import com.moulberry.fbrtoworld.FbrVersionCheck;
 import com.moulberry.fbrtoworld.FbrToWorldMod;
 import com.moulberry.fbrtoworld.FbrWorldConverter;
 import net.minecraft.client.Minecraft;
@@ -36,6 +38,11 @@ public final class FbrConversionLauncher {
         FbrBackgroundOverlay.resetForNewConversion();
 
         List<Path> paths = new ArrayList<>(recordings);
+        String mismatch = FbrVersionCheck.findMismatch(paths);
+        if (mismatch != null) {
+            FbrVersionCheck.showError(minecraft, previousScreen, mismatch);
+            return;
+        }
         if (paths.isEmpty()) {
             FbrToWorldMod.LOGGER.warn("[FbrToWorld] Convert requested with no recordings selected");
             return;
@@ -45,7 +52,7 @@ public final class FbrConversionLauncher {
         var level = minecraft.level;
         var cached = FbrToWorldMod.cachedRegistryAccess;
 
-        FbrToWorldMod.LOGGER.info(
+        FbrDiagnostics.info(
                 "[FbrToWorld] Convert clicked — recordings={}, targetWorld={}, connection={}, level={}, cachedRegistryAccess={}",
                 paths.size(), targetWorld, connection != null, level != null, cached != null);
 
@@ -65,10 +72,10 @@ public final class FbrConversionLauncher {
             source = "none available";
         }
 
-        FbrToWorldMod.LOGGER.info("[FbrToWorld] Using registry access source: {}", source);
+        FbrDiagnostics.info("[FbrToWorld] Using registry access source: {}", source);
 
         if (registryAccess == null) {
-            FbrToWorldMod.LOGGER.info(
+            FbrDiagnostics.info(
                     "[FbrToWorld] No live/cached registries — loading vanilla registries in the background");
             startAfterLoadingRegistries(minecraft, previousScreen, paths, targetWorld);
             return;
@@ -77,7 +84,7 @@ public final class FbrConversionLauncher {
         boolean started = targetWorld != null
                 ? FbrWorldConverter.startImport(paths, registryAccess, minecraft, targetWorld)
                 : FbrWorldConverter.start(paths, registryAccess, minecraft);
-        FbrToWorldMod.LOGGER.info("[FbrToWorld] FbrWorldConverter start returned: {}", started);
+        FbrDiagnostics.info("[FbrToWorld] FbrWorldConverter start returned: {}", started);
         if (started) {
             minecraft.setScreen(new FbrConvertProgressScreen(previousScreen));
         }
@@ -88,7 +95,7 @@ public final class FbrConversionLauncher {
 
         FbrRegistryLoader.loadVanillaRegistries().thenAccept(registryAccess -> {
             minecraft.execute(() -> {
-                FbrToWorldMod.LOGGER.info("[FbrToWorld] Vanilla registries loaded, starting conversion");
+                FbrDiagnostics.info("[FbrToWorld] Vanilla registries loaded, starting conversion");
                 boolean started = targetWorld != null
                         ? FbrWorldConverter.startImport(paths, registryAccess, minecraft, targetWorld)
                         : FbrWorldConverter.start(paths, registryAccess, minecraft);

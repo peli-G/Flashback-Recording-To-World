@@ -35,7 +35,6 @@ import java.util.*;
 public class FbrWorldConverter {
 
     private static final int DATA_VERSION = net.minecraft.SharedConstants.getCurrentVersion().dataVersion().version();
-    private static final String VERSION_NAME = net.minecraft.SharedConstants.getCurrentVersion().name();
 
     public static volatile boolean running = false;
     public static volatile boolean cancelRequested = false;
@@ -64,7 +63,7 @@ public class FbrWorldConverter {
     public static volatile Path progressStagingPath = null;
 
     public static void cancel() {
-        FbrToWorldMod.LOGGER.info("[FbrToWorld] Cancel requested by user");
+        FbrDiagnostics.info("[FbrToWorld] Cancel requested by user");
         cancelRequested = true;
         Thread t = currentThread;
         if (t != null) t.interrupt();
@@ -84,7 +83,7 @@ public class FbrWorldConverter {
 
     private static boolean start(List<Path> fbrPaths, RegistryAccess registryAccess, Minecraft mc, Path existingWorldTarget) {
         final boolean importMode = existingWorldTarget != null;
-        FbrToWorldMod.LOGGER.info("[FbrToWorld] start() called — {} recording(s)={}, alreadyRunning={}, importMode={}",
+        FbrDiagnostics.info("[FbrToWorld] start() called — {} recording(s)={}, alreadyRunning={}, importMode={}",
                 fbrPaths.size(), fbrPaths, running, importMode);
         if (running) {
             FbrToWorldMod.LOGGER.warn("[FbrToWorld] start() aborted — a conversion is already running");
@@ -117,18 +116,18 @@ public class FbrWorldConverter {
         activeWorldName = importMode || typedName == null || typedName.isBlank() ? null : typedName.trim();
         Thread t = new Thread(() -> {
             try {
-                FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion thread started for {}", inputs);
+                FbrDiagnostics.info("[FbrToWorld] Conversion thread started for {}", inputs);
                 convert(inputs, registryAccess, mc, existingWorldTarget);
-                FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion thread completed normally for {}", inputs);
+                FbrDiagnostics.info("[FbrToWorld] Conversion thread completed normally for {}", inputs);
             } catch (CancellationException e) {
-                FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion cancelled by user");
+                FbrDiagnostics.info("[FbrToWorld] Conversion cancelled by user");
                 cleanupAfterCancel(mc, importMode);
                 sendMessage(mc, "§e[FbrToWorld] Conversion cancelled.");
                 progressResultMessage = "Cancelled.";
                 progressDone = true;
             } catch (Exception e) {
                 if (cancelRequested) {
-                    FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion stopped due to cancellation");
+                    FbrDiagnostics.info("[FbrToWorld] Conversion stopped due to cancellation");
                     cleanupAfterCancel(mc, importMode);
                     sendMessage(mc, "§e[FbrToWorld] Conversion cancelled.");
                     progressResultMessage = "Cancelled.";
@@ -139,7 +138,8 @@ public class FbrWorldConverter {
                     writeLevelDatIfMissing(mc, importMode);
                     sendMessage(mc, "§c[FbrToWorld] Failed: " + e.getMessage() + " — see log.");
                     progressFailed = true;
-                    progressResultMessage = "Failed: " + e.getMessage();
+                    progressResultMessage = e.getMessage() != null && !e.getMessage().isBlank()
+                            ? e.getMessage() : e.getClass().getSimpleName();
                     progressDone = true;
                 }
             } finally {
@@ -150,7 +150,7 @@ public class FbrWorldConverter {
         t.setDaemon(true);
         currentThread = t;
         t.start();
-        FbrToWorldMod.LOGGER.info("[FbrToWorld] Conversion thread launched, start() returning true");
+        FbrDiagnostics.info("[FbrToWorld] Conversion thread launched, start() returning true");
         return true;
     }
 
@@ -292,6 +292,13 @@ public class FbrWorldConverter {
         final int[] skippedPerRecording;
         final java.util.concurrent.atomic.AtomicLong olderCopiesSkipped = new java.util.concurrent.atomic.AtomicLong();
         int written, skipped, processed;
+        final List<String> errorSamples = new ArrayList<>();
+
+        void noteError(String message) {
+            synchronized (this.errorSamples) {
+                if (this.errorSamples.size() < 3 && !this.errorSamples.contains(message)) this.errorSamples.add(message);
+            }
+        }
 
         WriteContext(int recordingCount, Map<String, Path> dimPaths,
                      Map<String, Map<Long, RegionFileWriter>> regionWriters,
@@ -381,7 +388,7 @@ public class FbrWorldConverter {
             var buf = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(pc.data()), registryAccess);
             var pkt = codec.decode(buf);
             if (!(pkt instanceof ClientboundLevelChunkWithLightPacket cp)) {
-                return new EncodedChunk(null, false, null, null, null, null); // not a chunk packet
+                return new EncodedChunk(null, false, null, null, null, null);
             }
             pos = new ChunkPos(cp.getX(), cp.getZ());
 
@@ -467,6 +474,7 @@ public class FbrWorldConverter {
             if (res.decodeError() != null) {
                 FbrToWorldMod.LOGGER.warn("[FbrToWorld] Skipped {}/idx {} (recording {}): {}",
                         dim, pc.index(), r + 1, res.decodeError());
+                ctx.noteError(res.decodeError());
                 ctx.skipped++;
                 ctx.skippedPerRecording[r]++;
                 continue;
@@ -505,6 +513,7 @@ public class FbrWorldConverter {
             } catch (Exception e) {
                 FbrToWorldMod.LOGGER.warn("[FbrToWorld] Skipped {}/idx {} (recording {}): {}",
                         dim, pc.index(), r + 1, e.getMessage());
+                ctx.noteError(String.valueOf(e.getMessage()));
                 ctx.skipped++;
                 ctx.skippedPerRecording[r]++;
             }
@@ -683,7 +692,7 @@ public class FbrWorldConverter {
                         + " → " + scannedHere + " chunks (" + kept + " candidate positions)");
                 sendMessage(mc, "§8[FbrToWorld]      " + area
                         + " | dims: " + (dims.length() == 0 ? "none" : dims));
-                FbrToWorldMod.LOGGER.info("[FbrToWorld] Recording {} ({}): scanned={} kept={} area={} dims={}",
+                FbrDiagnostics.info("[FbrToWorld] Recording {} ({}): scanned={} kept={} area={} dims={}",
                         r + 1, inputs.get(r).getFileName(), scannedHere, kept, area, dims);
             }
         }
@@ -746,7 +755,7 @@ public class FbrWorldConverter {
 
         Map<String, Path> dimPaths = new LinkedHashMap<>();
         for (String dimId : merged.keySet()) {
-            Path dp = resolveDimPath(writeRoot, dimId);
+            Path dp = WorldLayout.dimensionPath(writeRoot, dimId);
             Files.createDirectories(dp.resolve("region"));
             Files.createDirectories(dp.resolve("entities"));
             dimPaths.put(dimId, dp);
@@ -885,9 +894,11 @@ public class FbrWorldConverter {
 
         if (importMode) {
             sendMessage(mc, "§a[FbrToWorld] Merging chunks into " + worldPath.getFileName() + "...");
+            String layoutNotice = WorldLayout.importNotice(worldPath);
+            if (layoutNotice != null) sendMessage(mc, layoutNotice);
             for (String dimId : merged.keySet()) {
-                Path stagedDim = resolveDimPath(stagingRoot, dimId);
-                Path realDim = resolveDimPath(worldPath, dimId);
+                Path stagedDim = WorldLayout.dimensionPath(stagingRoot, dimId);
+                Path realDim = WorldLayout.importDimensionPath(worldPath, dimId);
                 Files.createDirectories(realDim.resolve("region"));
                 Files.createDirectories(realDim.resolve("entities"));
                 mergeRegionDir(stagedDim.resolve("region"), realDim.resolve("region"));
@@ -903,7 +914,7 @@ public class FbrWorldConverter {
                         + " → wrote " + writtenPerRecording[r] + " chunks"
                         + (skippedPerRecording[r] > 0 ? " (" + skippedPerRecording[r] + " failed)" : "");
                 sendMessage(mc, (writtenPerRecording[r] == 0 ? "§c" : "§7") + "[FbrToWorld]" + line);
-                FbrToWorldMod.LOGGER.info("[FbrToWorld]{}", line);
+                FbrDiagnostics.info("[FbrToWorld]{}", line);
             }
         }
 
@@ -935,6 +946,27 @@ public class FbrWorldConverter {
         progressCurrent = written;
         progressTotal = totalChunks;
         progressResultMessage = resultMsg;
+        StringBuilder detail = new StringBuilder();
+        if (skipped > 0) {
+            detail.append(skipped).append(" chunk(s) failed to convert.");
+            synchronized (ctx.errorSamples) {
+                if (!ctx.errorSamples.isEmpty()) detail.append(" e.g. ").append(String.join(" | ", ctx.errorSamples));
+            }
+        }
+        if (written == 0) {
+            progressFailed = true;
+            progressResultMessage = "No chunks were converted"
+                    + (skipped == 0 ? " - the recording may be from an unsupported version or contain no chunks" : "");
+        }
+        if (!translator.enabled && translator.disabledReason != null) {
+            if (detail.length() > 0) detail.append(' ');
+            detail.append("Direct translation was switched off: ").append(translator.disabledReason);
+        }
+        if (written == 0) {
+            FbrToWorldMod.LOGGER.error("[FbrToWorld] {}. {}", progressResultMessage, detail);
+        } else if (detail.length() > 0) {
+            FbrToWorldMod.LOGGER.warn("[FbrToWorld] {}", detail);
+        }
         progressDone = true;
     }
 
@@ -1012,7 +1044,7 @@ public class FbrWorldConverter {
             }
             LAST_CACHE_COUNTS.put(fbrPath, entriesPerFile);
 
-            FbrToWorldMod.LOGGER.info("[FbrToWorld] {}: indexed {} of {} cache entries",
+            FbrDiagnostics.info("[FbrToWorld] {}: indexed {} of {} cache entries",
                     fbrPath.getFileName(), indexToXZ.size(), totalPackets);
 
             String[] currentDim = {"minecraft:overworld"};
@@ -1188,18 +1220,6 @@ public class FbrWorldConverter {
         }
     }
 
-    private static Path resolveDimPath(Path worldPath, String dimId) {
-        return switch (dimId) {
-            case "minecraft:overworld"  -> worldPath;
-            case "minecraft:the_nether" -> worldPath.resolve("DIM-1");
-            case "minecraft:the_end"    -> worldPath.resolve("DIM1");
-            default -> {
-                String[] parts = dimId.split(":", 2);
-                yield worldPath.resolve("dimensions").resolve(parts[0]).resolve(parts[1]);
-            }
-        };
-    }
-
     private static int readInt4(byte[] b, int off) {
         return ((b[off] & 0xff) << 24) | ((b[off + 1] & 0xff) << 16)
              | ((b[off + 2] & 0xff) << 8)  |  (b[off + 3] & 0xff);
@@ -1280,6 +1300,7 @@ public class FbrWorldConverter {
 
             int nonAirInSection = rfbb.readShort();
             if (nonAirInSection > 0) blockCountOut[0] += nonAirInSection;
+            if (ChunkWire.SECTION_HAS_FLUID_COUNT) rfbb.readShort();
 
             PalettedContainer<BlockState> states = new PalettedContainer<>(
                     Blocks.AIR.defaultBlockState(),
@@ -1340,136 +1361,11 @@ public class FbrWorldConverter {
     }
 
     static void writeLevelDat(Path worldFolder, String worldName) throws IOException {
-        CompoundTag data = new CompoundTag();
-        data.putInt("DataVersion",  DATA_VERSION);
-        data.putString("LevelName", worldName);
-        data.putLong("LastPlayed",  System.currentTimeMillis());
-        data.putInt("version",      19133);
-        data.putInt("GameType",     1);
-        data.putByte("Difficulty",  (byte) 2);
-        data.putByte("DifficultyLocked", (byte) 0);
-        data.putByte("initialized", (byte) 1);
-        data.putByte("hardcore",    (byte) 0);
-        data.putByte("allowCommands", (byte) 1);
-        data.putByte("WasModded",   (byte) 1);
-
-        data.putLong("Time", 0L);
-        data.putLong("DayTime", 0L);
-        data.putByte("raining",   (byte) 0);
-        data.putByte("thundering", (byte) 0);
-        data.putInt("rainTime",   0);
-        data.putInt("thunderTime", 0);
-        data.putInt("clearWeatherTime", 0);
-        data.putInt("WanderingTraderSpawnChance", 25);
-        data.putInt("WanderingTraderSpawnDelay",  24000);
-
-        CompoundTag spawn = new CompoundTag();
-        spawn.put("pos", new net.minecraft.nbt.IntArrayTag(new int[]{8, -64, 8}));
-        spawn.putFloat("pitch", 0.0f);
-        spawn.putFloat("yaw",   0.0f);
-        spawn.putString("dimension", "minecraft:overworld");
-        data.put("spawn", spawn);
-
-        CompoundTag version = new CompoundTag();
-        version.putString("Name",   VERSION_NAME);
-        version.putInt("Id",        DATA_VERSION);
-        version.putString("Series", "main");
-        version.putByte("Snapshot", (byte) 0);
-        data.put("Version", version);
-
-        CompoundTag gameRules = new CompoundTag();
-        for (var entry : com.moulberry.fbrtoworld.config.FbrGameRuleConfig.load().entrySet()) {
-            String value = entry.getValue();
-            if (value.equals("true") || value.equals("false")) {
-                gameRules.putByte(entry.getKey(), (byte) (value.equals("true") ? 1 : 0));
-            } else {
-                try {
-                    gameRules.putInt(entry.getKey(), Integer.parseInt(value));
-                } catch (NumberFormatException e) {
-                    gameRules.putByte(entry.getKey(), (byte) 1);
-                }
-            }
-        }
-        data.put("game_rules", gameRules);
-
-        CompoundTag dataPacks = new CompoundTag();
-        ListTag enabled = new ListTag();
-        enabled.add(StringTag.valueOf("vanilla"));
-        dataPacks.put("Enabled", enabled);
-        dataPacks.put("Disabled", new ListTag());
-        data.put("DataPacks", dataPacks);
-
-        CompoundTag dragonFight = new CompoundTag();
-        dragonFight.putByte("PreviouslyKilled",    (byte) 0);
-        dragonFight.putByte("NeedsStateScanning",  (byte) 1);
-        dragonFight.putByte("DragonKilled",        (byte) 0);
-        data.put("DragonFight", dragonFight);
-
-        data.put("CustomBossEvents", new CompoundTag());
-        data.put("ScheduledEvents",  new ListTag());
-        ListTag serverBrands = new ListTag();
-        serverBrands.add(StringTag.valueOf("fabric"));
-        data.put("ServerBrands", serverBrands);
-
-        CompoundTag worldGenSettings = new CompoundTag();
-        worldGenSettings.putLong("seed", 0L);
-        worldGenSettings.putByte("generate_features", (byte) 0);
-        worldGenSettings.putByte("bonus_chest",       (byte) 0);
-        CompoundTag dimensions = new CompoundTag();
-        CompoundTag overworld  = new CompoundTag();
-        overworld.putString("type", "minecraft:overworld");
-        CompoundTag gen = new CompoundTag();
-        gen.putString("type", "minecraft:flat");
-        CompoundTag genSettings = new CompoundTag();
-        genSettings.put("layers",  new ListTag());
-        genSettings.putString("biome", "minecraft:plains");
-        genSettings.putByte("features", (byte) 0);
-        genSettings.putByte("lakes",    (byte) 0);
-        gen.put("settings", genSettings);
-        overworld.put("generator", gen);
-        dimensions.put("minecraft:overworld", overworld);
-
-        CompoundTag nether = new CompoundTag();
-        nether.putString("type", "minecraft:the_nether");
-        CompoundTag netherGen = new CompoundTag();
-        netherGen.putString("type", "minecraft:flat");
-        CompoundTag netherSettings = new CompoundTag();
-        netherSettings.put("layers", new ListTag());
-        netherSettings.putString("biome", "minecraft:nether_wastes");
-        netherSettings.putByte("features", (byte) 0);
-        netherSettings.putByte("lakes", (byte) 0);
-        netherGen.put("settings", netherSettings);
-        nether.put("generator", netherGen);
-        dimensions.put("minecraft:the_nether", nether);
-
-        CompoundTag end = new CompoundTag();
-        end.putString("type", "minecraft:the_end");
-        CompoundTag endGen = new CompoundTag();
-        endGen.putString("type", "minecraft:flat");
-        CompoundTag endSettings = new CompoundTag();
-        endSettings.put("layers", new ListTag());
-        endSettings.putString("biome", "minecraft:the_end");
-        endSettings.putByte("features", (byte) 0);
-        endSettings.putByte("lakes", (byte) 0);
-        endGen.put("settings", endSettings);
-        end.put("generator", endGen);
-        dimensions.put("minecraft:the_end", end);
-
-        worldGenSettings.put("dimensions", dimensions);
-        data.put("WorldGenSettings", worldGenSettings);
-
-        CompoundTag root = new CompoundTag();
-        root.put("Data", data);
-        NbtIo.writeCompressed(root, worldFolder.resolve("level.dat"));
-        Files.write(worldFolder.resolve("session.lock"),
-                ByteBuffer.allocate(8).putLong(System.currentTimeMillis()).array());
+        WorldLayout.writeLevelData(worldFolder, worldName);
     }
 
     static void sendMessage(Minecraft mc, String message) {
-        FbrToWorldMod.LOGGER.info(message);
-        mc.execute(() -> {
-            if (mc.gui != null) mc.gui.getChat().addMessage(Component.literal(message));
-        });
+        FbrDiagnostics.info("{}", message.replaceAll("§.", ""));
     }
 
     private static void setActionBar(Minecraft mc, String stage, int done, int total) {
@@ -1483,14 +1379,8 @@ public class FbrWorldConverter {
         String bar  = "█".repeat(filled) + "░".repeat(20 - filled);
         String msg  = "§a[FbrToWorld] §f" + stage + " §7[§a" + bar + "§7] §f" + pct
                     + "% §7(" + clamped + "/" + total + ")";
-        mc.execute(() -> {
-            if (mc.gui != null) mc.gui.setOverlayMessage(Component.literal(msg), false);
-        });
     }
 
     private static void clearActionBar(Minecraft mc) {
-        mc.execute(() -> {
-            if (mc.gui != null) mc.gui.setOverlayMessage(Component.literal(""), false);
-        });
     }
 }

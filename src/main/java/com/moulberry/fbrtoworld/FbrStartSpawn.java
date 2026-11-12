@@ -74,7 +74,7 @@ public final class FbrStartSpawn {
         try {
             pending = read(fbrPath, codec, registryAccess);
             if (pending != null) {
-                FbrToWorldMod.LOGGER.info("[FbrToWorld] Recording start: {} {} {} in {}",
+                FbrDiagnostics.info("[FbrToWorld] Recording start: {} {} {} in {}",
                         pending.x(), pending.y(), pending.z(), pending.dimension());
             } else {
                 FbrToWorldMod.LOGGER.warn("[FbrToWorld] Couldn't find the recording's start position in {}", fbrPath.getFileName());
@@ -94,10 +94,10 @@ public final class FbrStartSpawn {
             return;
         }
         try {
-            patchLevelDat(worldFolder.resolve("level.dat"), start);
+            patchLevelDat(worldFolder.resolve("level.dat"), start, mc);
             String where = (int) Math.floor(start.x()) + ", " + (int) Math.floor(start.y()) + ", " + (int) Math.floor(start.z());
             String dimName = start.dimension().substring(start.dimension().indexOf(':') + 1);
-            FbrToWorldMod.LOGGER.info("[FbrToWorld] Spawn set to recording start {} ({})", where, dimName);
+            FbrDiagnostics.info("[FbrToWorld] Spawn set to recording start {} ({})", where, dimName);
             if (mc != null) {
                 FbrWorldConverter.sendMessage(mc, "§a[FbrToWorld] Spawn set to where the recording started: §f"
                         + where + " §7(" + dimName + ")");
@@ -236,7 +236,7 @@ public final class FbrStartSpawn {
     // level.dat patching (plain-Java NBT so it doesn't depend on MC's NBT API)
     // ------------------------------------------------------------------------------------
 
-    private static void patchLevelDat(Path levelDat, StartPos start) throws IOException {
+    private static void patchLevelDat(Path levelDat, StartPos start, Minecraft mc) throws IOException {
         Map<String, Object> root;
         try (DataInputStream in = new DataInputStream(new BufferedInputStream(new GZIPInputStream(Files.newInputStream(levelDat))))) {
             if (in.readByte() != Nbt.COMPOUND) throw new IOException("level.dat root is not a compound");
@@ -253,23 +253,14 @@ public final class FbrStartSpawn {
         // World spawn / respawn point -> recording start.
         Map<String, Object> spawn = new LinkedHashMap<>();
         spawn.put("pos", new Nbt.Tag(Nbt.INT_ARRAY, new int[]{bx, by, bz}));
-        spawn.put("pitch", new Nbt.Tag(Nbt.FLOAT, start.pitch()));
-        spawn.put("yaw", new Nbt.Tag(Nbt.FLOAT, start.yaw()));
+        float spawnYaw = start.yaw() - 360.0f * (float) Math.floor((start.yaw() + 180.0f) / 360.0f);
+        float spawnPitch = Math.max(-90.0f, Math.min(90.0f, start.pitch()));
+        spawn.put("pitch", new Nbt.Tag(Nbt.FLOAT, spawnPitch));
+        spawn.put("yaw", new Nbt.Tag(Nbt.FLOAT, spawnYaw));
         spawn.put("dimension", new Nbt.Tag(Nbt.STRING, start.dimension()));
         data.put("spawn", new Nbt.Tag(Nbt.COMPOUND, spawn));
 
-        // Saved singleplayer player -> exact recording start (no random spawn-radius offset,
-        // works in the Nether/End too).
-        Map<String, Object> player = new LinkedHashMap<>();
-        player.put("Pos", new Nbt.Tag(Nbt.LIST, new Nbt.ListValue(Nbt.DOUBLE,
-                List.of(start.x(), start.y(), start.z()))));
-        player.put("Rotation", new Nbt.Tag(Nbt.LIST, new Nbt.ListValue(Nbt.FLOAT,
-                List.of(start.yaw(), start.pitch()))));
-        player.put("Dimension", new Nbt.Tag(Nbt.STRING, start.dimension()));
-        Object gameType = data.get("GameType");
-        int gt = gameType instanceof Nbt.Tag t && t.value instanceof Integer i ? i : 1;
-        player.put("playerGameType", new Nbt.Tag(Nbt.INT, gt));
-        data.put("Player", new Nbt.Tag(Nbt.COMPOUND, player));
+        WorldLayout.writePlayerStart(levelDat.getParent(), data, start, mc);
 
         Path tmp = levelDat.resolveSibling("level.dat_fbrtmp");
         try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(new GZIPOutputStream(Files.newOutputStream(tmp))))) {

@@ -1,0 +1,35 @@
+plugins {
+    id 'net.fabricmc.fabric-loom'
+}
+
+apply from: rootProject.file('gradle/mod-common.gradle')
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+}
+
+def transformRules = file('source-transform.rules')
+def transformedDir = layout.buildDirectory.dir('generated/sources/transformed')
+
+tasks.register('transformSources', Sync) {
+    from rootProject.file('src/main/java')
+    into transformedDir
+    inputs.file(transformRules)
+    filteringCharset = 'UTF-8'
+    def rules = transformRules.readLines('UTF-8')
+            .findAll { it.trim() && !it.startsWith('#') }
+            .collect { line ->
+                def parts = line.split('\t', 2)
+                [java.util.regex.Pattern.compile(parts[0]), parts[1]]
+            }
+    filter { String line ->
+        rules.inject(line) { current, rule -> rule[0].matcher(current).replaceAll(rule[1]) }
+    }
+}
+
+sourceSets.main.java.srcDirs = [
+        tasks.named('transformSources'),
+        rootProject.file('src/mc26/java')
+]

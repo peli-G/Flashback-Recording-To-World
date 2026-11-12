@@ -1,0 +1,22 @@
+# Rewrites the shared (1.21.11-named) sources into 26.x API names before compiling the 26.x jar.
+# One rule per line: Java regex <TAB> replacement. Applied top to bottom, line by line.
+\brenderContents\(	extractContents(
+\brenderContent\(	extractContent(
+\brenderWidget\(	extractWidgetRenderState(
+\brenderDefaultSprite\(	extractDefaultSprite(
+\bsuper\.render\(	super.extractRenderState(
+\bpublic void render\(	public void extractRenderState(
+\bsearchBox\.render\(	searchBox.extractRenderState(
+\.afterRender\b	.afterExtract
+\bGuiGraphics\b	GuiGraphicsExtractor
+\bdrawCenteredString\(	centeredText(
+\bdrawString\(	text(
+\bEditGameRulesScreen\b	WorldCreationGameRulesScreen
+\b(minecraft|mc)\.setScreen\(	$1.gui.setScreen(
+\.getInstance\(\)\.setScreen\(	.getInstance().gui.setScreen(
+\bminecraft\.screen\.	minecraft.gui.screen().
+this\.minecraft\.options\.touchscreen\(\)\.get\(\) \|\| hovered	hovered
+\b(mc)\.gui\.getChat\(\)\.addMessage\(	$1.gui.hud.getChat().addClientSystemMessage(
+\b(mc)\.gui\.setOverlayMessage\(	$1.gui.hud.setOverlayMessage(
+\bpos\.(x|z)\b(?!\()	pos.$1()
+\bChunkPos\.asLong\(	ChunkPos.pack(

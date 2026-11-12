@@ -42,7 +42,7 @@ public class FbrRegistryLoader {
             if (throwable != null) {
                 FbrToWorldMod.LOGGER.error("[FbrToWorld] Failed to load vanilla registries", throwable);
             } else {
-                FbrToWorldMod.LOGGER.info("[FbrToWorld] Loaded vanilla registries without a world (registries: {})",
+                FbrDiagnostics.info("[FbrToWorld] Loaded vanilla registries without a world (registries: {})",
                         result.registries().count());
             }
             pending = null;

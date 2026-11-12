@@ -1,0 +1,17 @@
+plugins {
+    id 'net.fabricmc.fabric-loom-remap'
+}
+
+apply from: rootProject.file('gradle/mod-common.gradle')
+
+dependencies {
+    minecraft    "com.mojang:minecraft:${project.minecraft_version}"
+    mappings     loom.officialMojangMappings()
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+}
+
+sourceSets.main.java.srcDirs = [
+        rootProject.file('src/main/java'),
+        rootProject.file('src/mc1_21/java')
+]

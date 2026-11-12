@@ -213,6 +213,7 @@ final class FbrChunkTranslator {
 
                 int nonAir = in.readShort();
                 if (nonAir > 0) blockCountOut[0] += nonAir;
+                if (ChunkWire.SECTION_HAS_FLUID_COUNT) in.readShort();
 
                 Map<String, Object> blocks = readContainer(s, in, 4096, true, lengthPrefixedArrays);
                 Map<String, Object> biomes = readContainer(s, in, 64, false, lengthPrefixedArrays);

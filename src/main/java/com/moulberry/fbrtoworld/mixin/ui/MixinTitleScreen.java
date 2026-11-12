@@ -1,5 +1,6 @@
 package com.moulberry.fbrtoworld.mixin.ui;
 
+import com.moulberry.fbrtoworld.FbrDiagnostics;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
 import net.fabricmc.loader.api.FabricLoader;
@@ -148,7 +149,7 @@ public abstract class MixinTitleScreen extends Screen {
 
     @Unique
     private void fbr$onButtonPressed() {
-        com.moulberry.fbrtoworld.FbrToWorldMod.LOGGER.info(
+        FbrDiagnostics.info(
                 "[FbrToWorld] Title screen button pressed — opening FbrSelectReplayScreen "
                 + "(connection={}, level={}, cachedRegistry={})",
                 this.minecraft.getConnection() != null, this.minecraft.level != null,

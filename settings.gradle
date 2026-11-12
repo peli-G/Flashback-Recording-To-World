@@ -5,3 +5,11 @@ pluginManagement {
         gradlePluginPortal()
     }
 }
+
+rootProject.name = 'FBR-to-World'
+
+include 'mc-1.21.11'
+include 'mc-26.2'
+
+project(':mc-1.21.11').projectDir = file('versions/1.21.11')
+project(':mc-26.2').projectDir = file('versions/26.2')

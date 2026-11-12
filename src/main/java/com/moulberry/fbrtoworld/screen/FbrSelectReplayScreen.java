@@ -1,6 +1,10 @@
 package com.moulberry.fbrtoworld.screen;
 
+import com.moulberry.fbrtoworld.FbrDiagnostics;
 import com.moulberry.fbrtoworld.FbrToWorldMod;
+import com.moulberry.fbrtoworld.FbrVersionCheck;
+import net.minecraft.client.input.KeyEvent;
+import org.lwjgl.glfw.GLFW;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.CycleButton;
@@ -96,6 +100,7 @@ public class FbrSelectReplayScreen extends Screen {
         super.render(guiGraphics, mouseX, mouseY, partialTick);
         this.searchBox.render(guiGraphics, mouseX, mouseY, partialTick);
         guiGraphics.drawCenteredString(this.font, this.title, this.width / 2, 8, 0xFFFFFFFF);
+        FbrDiagnostics.drawLabel(guiGraphics, this.font, this.height);
 
         if (this.combineMode) {
             int combining = this.combineCount();
@@ -113,6 +118,17 @@ public class FbrSelectReplayScreen extends Screen {
             }
             guiGraphics.drawCenteredString(this.font, hint, this.width / 2, this.height - 62, hintColour);
         }
+    }
+
+    @Override
+    public boolean keyPressed(KeyEvent keyEvent) {
+        int mods = keyEvent.modifiers();
+        if (keyEvent.key() == GLFW.GLFW_KEY_D
+                && (mods & GLFW.GLFW_MOD_CONTROL) != 0 && (mods & GLFW.GLFW_MOD_SHIFT) != 0) {
+            FbrDiagnostics.toggle();
+            return true;
+        }
+        return super.keyPressed(keyEvent);
     }
 
     @Override
@@ -156,6 +172,11 @@ public class FbrSelectReplayScreen extends Screen {
 
     
     public void openConvertOptions(Path selectedReplay) {
+        String mismatch = FbrVersionCheck.findMismatch(selectedReplay);
+        if (mismatch != null) {
+            FbrVersionCheck.showError(this.minecraft, this, mismatch);
+            return;
+        }
         this.minecraft.setScreen(new FbrConvertOptionsScreen(this, selectedReplay));
     }
 
@@ -163,6 +184,11 @@ public class FbrSelectReplayScreen extends Screen {
         if (this.combineMode) {
             List<Path> combine = this.list.getCombineSelection();
             if (!combine.isEmpty()) {
+                String mismatch = FbrVersionCheck.findMismatch(combine);
+                if (mismatch != null) {
+                    FbrVersionCheck.showError(this.minecraft, this, mismatch);
+                    return;
+                }
                 FbrConversionLauncher.start(this.minecraft, this.lastScreen, combine);
             }
             return;

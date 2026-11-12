@@ -1,46 +1,4 @@
 plugins {
-    id 'fabric-loom' version '1.14-SNAPSHOT'
-    id 'java'
-}
-
-version = "${project.mod_version}+${project.minecraft_version}"
-group   = project.maven_group
-
-processResources {
-    inputs.property "version", project.version
-    filteringCharset = "UTF-8"
-
-    filesMatching("fabric.mod.json") {
-        expand "version": project.version
-    }
-}
-
-base {
-    archivesName = project.archives_base_name
-}
-
-repositories {
-    maven { name = 'FabricMC'; url = 'https://maven.fabricmc.net/' }
-    mavenCentral()
-}
-
-dependencies {
-    minecraft    "com.mojang:minecraft:${project.minecraft_version}"
-    mappings     loom.officialMojangMappings()
-    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
-    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
-    // Fully standalone — no Flashback dependency, even compile-only. Flashback's
-    // button (if installed alongside) is detected purely via reflection at runtime
-    // in MixinTitleScreen, for position-avoidance only.
-}
-
-java {
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
-    withSourcesJar()
-}
-
-tasks.withType(JavaCompile).configureEach {
-    options.encoding = 'UTF-8'
-    options.release  = 21
+    id 'net.fabricmc.fabric-loom' version "${loom_version}" apply false
+    id 'net.fabricmc.fabric-loom-remap' version "${loom_version}" apply false
 }
