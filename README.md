@@ -20,6 +20,7 @@ Press the Gamerule Options to configure your default gamerules for the converted
 Fabric API is required for this mod to work. You can download it [here](https://modrinth.com/mod/fabric-api).
 
 # Building
+Java 25 Required
  - `./gradlew build` builds every version.
  - `./gradlew :mc-1.21.11:build` or `./gradlew :mc-26.2:build` builds one version.
  - The jars are in `versions/<version>/build/libs`.
