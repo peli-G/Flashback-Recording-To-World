@@ -31,10 +31,16 @@ public final class FbrVersionCheck {
     public static String findMismatch(Path recording) {
         FbrMeta meta = readMeta(recording);
         if (meta == null) return null;
-        if (VersionSupport.accepts(meta.dataVersion, meta.versionString)) return null;
-
         String recorded = meta.versionString != null ? meta.versionString : "data version " + meta.dataVersion;
         String current = SharedConstants.getCurrentVersion().name();
+        FbrDeveloperMode.log("Version check for {}: recorded on {} (data {}), instance is {}",
+                recording.getFileName(), recorded, meta.dataVersion, current);
+        if (VersionSupport.accepts(meta.dataVersion, meta.versionString)) return null;
+        if (FbrDeveloperMode.isEnabled()) {
+            FbrDeveloperMode.log("Version limit bypassed for {} (recorded on {}, instance is {})",
+                    recording.getFileName(), recorded, current);
+            return null;
+        }
         FbrDiagnostics.info("[FbrToWorld] Version mismatch for {}: recorded on {} (data {}), instance is {}",
                 recording.getFileName(), recorded, meta.dataVersion, current);
         return "This Flashback was recorded on version " + recorded + ", and you are trying to convert it on "

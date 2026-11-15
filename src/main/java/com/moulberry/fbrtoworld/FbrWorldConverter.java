@@ -350,11 +350,13 @@ public class FbrWorldConverter {
                 int myIdx = idx++;
                 String dim = winnerIndexToDim.get(myIdx);
                 if (dim == null) {
+                    FbrDeveloperMode.log("Cache {} entry {}: {} bytes, not referenced by the timeline, skipped", cacheFile.getFileName(), myIdx, size);
                     skipFully(is, size);
                     continue;
                 }
                 Long posKey = posByIndex.get(myIdx);
                 if (posKey != null && ctx.isFinal(dim, posKey)) {
+                    FbrDeveloperMode.log("Cache {} entry {}: {} bytes in {}, a newer copy of this chunk already has blocks, skipped", cacheFile.getFileName(), myIdx, size, dim);
                     skipFully(is, size);
                     ctx.olderCopiesSkipped.incrementAndGet();
                     skippedOut[0]++;
@@ -362,7 +364,11 @@ public class FbrWorldConverter {
                 }
 
                 byte[] data = is.readNBytes(size);
-                if (data.length < size) break;
+                if (data.length < size) {
+                    FbrDeveloperMode.log("Cache {} entry {}: truncated, wanted {} bytes but got {}", cacheFile.getFileName(), myIdx, size, data.length);
+                    break;
+                }
+                FbrDeveloperMode.log("Cache {} entry {}: read {} bytes for {}, queued for decoding", cacheFile.getFileName(), myIdx, size, dim);
 
                 batch.add(new PendingChunk(myIdx, dim, data));
                 if (batch.size() >= BATCH_SIZE) {
@@ -387,10 +393,15 @@ public class FbrWorldConverter {
         try {
             var buf = new RegistryFriendlyByteBuf(Unpooled.wrappedBuffer(pc.data()), registryAccess);
             var pkt = codec.decode(buf);
+            FbrDeveloperMode.log("Decoded packet for idx {} in {}: {} ({} bytes, {} left unread)",
+                    pc.index(), pc.dim(), pkt.getClass().getSimpleName(), pc.data().length, buf.readableBytes());
             if (!(pkt instanceof ClientboundLevelChunkWithLightPacket cp)) {
                 return new EncodedChunk(null, false, null, null, null, null);
             }
             pos = new ChunkPos(cp.getX(), cp.getZ());
+            FbrDeveloperMode.log("Chunk {},{} in {} (idx {}): light sections sky={} block={}",
+                    pos.x, pos.z, pc.dim(), pc.index(),
+                    cp.getLightData().getSkyYMask().cardinality(), cp.getLightData().getBlockYMask().cardinality());
 
             byte[] chunkNbtBytes = null;
             FbrChunkTranslator.Session tr = ctx.translator;
@@ -403,6 +414,8 @@ public class FbrWorldConverter {
                         CompoundTag original = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess, pc.dim(), blockCount);
                         byte[] originalBytes = FbrChunkTranslator.nbtBytes(original);
                         String diff = FbrNbtIO.compareChunks(direct.nbt(), originalBytes);
+                        FbrDeveloperMode.log("Chunk {},{}: verified direct translation against the old method: {}",
+                                pos.x, pos.z, diff == null ? "identical" : diff);
                         if (diff != null || direct.hasBlocks() != (blockCount[0] > 0)) {
                             tr.disable("chunk " + pos.x + "," + pos.z + " differed: "
                                     + (diff != null ? diff : "block count"));
@@ -418,11 +431,13 @@ public class FbrWorldConverter {
                         tr.noteSuccess();
                     }
                 } catch (Exception e) {
+                    FbrDeveloperMode.error("Direct translation failed for chunk " + pos.x + "," + pos.z + ", falling back to the old method", e);
                     tr.noteFailure(String.valueOf(e.getMessage()));
                     chunkNbtBytes = null;
                 }
             }
             if (chunkNbtBytes == null) {
+                FbrDeveloperMode.log("Chunk {},{}: using the old build method", pos.x, pos.z);
                 int[] blockCount = new int[1];
                 CompoundTag chunkNbt = buildChunkNbt(cp, ops, blockCodec, biomeCodec, registryAccess, pc.dim(), blockCount);
                 hasBlocks = blockCount[0] > 0;
@@ -431,8 +446,11 @@ public class FbrWorldConverter {
 
             byte[] chunkEntry = RegionFileWriter.encodeRaw(pos, chunkNbtBytes, ctx.lz4);
             byte[] entityEntry = RegionFileWriter.encode(pos, buildEntityChunkNbt(pos), ctx.lz4);
+            FbrDeveloperMode.log("Chunk {},{} encoded: nbt {} bytes, region entry {} bytes, entity entry {} bytes, hasBlocks={}",
+                    pos.x, pos.z, chunkNbtBytes.length, chunkEntry.length, entityEntry.length, hasBlocks);
             return new EncodedChunk(pos, hasBlocks, chunkEntry, entityEntry, null, null);
         } catch (Exception e) {
+            FbrDeveloperMode.error("Failed to decode or encode idx " + pc.index() + " in " + pc.dim(), e);
             String msg = String.valueOf(e.getMessage());
             return pos == null
                     ? new EncodedChunk(null, false, null, null, msg, null)
@@ -479,7 +497,10 @@ public class FbrWorldConverter {
                 ctx.skippedPerRecording[r]++;
                 continue;
             }
-            if (res.pos() == null) continue; // not a chunk packet
+            if (res.pos() == null) {
+                FbrDeveloperMode.log("idx {} in {} is not a chunk packet, ignored", pc.index(), dim);
+                continue;
+            }
 
             ChunkPos pos = res.pos();
             var states = ctx.stateFor(dim);
@@ -487,6 +508,7 @@ public class FbrWorldConverter {
             Byte state = states.get(posKey);
 
             if (state != null && state == 2) {
+                FbrDeveloperMode.log("Chunk {},{} in {}: already written with blocks from a newer copy, older idx {} dropped", pos.x, pos.z, dim, pc.index());
                 ctx.olderCopiesSkipped.incrementAndGet();
                 continue;
             }
@@ -507,6 +529,8 @@ public class FbrWorldConverter {
                             catch (Exception e) { throw new RuntimeException(e); }
                         }).writeEntry(pos, res.entityEntry());
 
+                FbrDeveloperMode.log("Wrote chunk {},{} in {} to {} (previous state {}, hasBlocks={})",
+                        pos.x, pos.z, dim, regionName, state, res.hasBlocks());
                 states.put(posKey, res.hasBlocks() ? (byte) 2 : (byte) 1);
                 if (state == null) ctx.written++;
                 ctx.writtenPerRecording[r]++;
@@ -1043,6 +1067,8 @@ public class FbrWorldConverter {
                 indexPool.shutdownNow();
             }
             LAST_CACHE_COUNTS.put(fbrPath, entriesPerFile);
+            FbrDeveloperMode.log("{}: {} cache file(s), entries per file {}, {} timeline file(s)",
+                    fbrPath.getFileName(), totalCacheFiles, Arrays.toString(entriesPerFile), totalFbFiles);
 
             FbrDiagnostics.info("[FbrToWorld] {}: indexed {} of {} cache entries",
                     fbrPath.getFileName(), indexToXZ.size(), totalPackets);
@@ -1067,6 +1093,8 @@ public class FbrWorldConverter {
                 int actionCount = fbuf.readVarInt();
                 List<String> actionNames = new ArrayList<>();
                 for (int i = 0; i < actionCount; i++) actionNames.add(fbuf.readUtf(32767));
+                FbrDeveloperMode.log("Timeline {} ({} bytes): {} registered actions {}",
+                        flashbackFiles.get(fbi).getFileName(), fbBytes.length, actionCount, actionNames);
 
                 int gamePacketId = -1, chunkCachedId = -1;
                 for (int i = 0; i < actionNames.size(); i++) {
@@ -1075,6 +1103,8 @@ public class FbrWorldConverter {
                 }
 
                 int snapSize = fbuf.readInt();
+                FbrDeveloperMode.log("Timeline {}: game_packet action id {}, level_chunk_cached action id {}, snapshot {} bytes",
+                        flashbackFiles.get(fbi).getFileName(), gamePacketId, chunkCachedId, snapSize);
                 byte[] snapBytes = new byte[snapSize];
                 fbuf.readBytes(snapBytes);
                 FriendlyByteBuf snapBuf = new FriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(snapBytes));
@@ -1124,6 +1154,7 @@ public class FbrWorldConverter {
                 out[n++] = value;
             }
         }
+        FbrDeveloperMode.log("Indexed cache file {}: {} entries", cacheFile.getFileName(), n);
         return Arrays.copyOf(out, n);
     }
 
@@ -1179,6 +1210,7 @@ public class FbrWorldConverter {
         while (buf.readableBytes() > 0) {
             int actionId = buf.readVarInt();
             int dataSize = buf.readInt();
+            FbrDeveloperMode.log("Action id {} ({} bytes)", actionId, dataSize);
 
             if (actionId == gamePacketId) {
                 byte[] actionData = new byte[dataSize];
@@ -1190,6 +1222,7 @@ public class FbrWorldConverter {
                 var actionBuf = new RegistryFriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(actionData), registryAccess);
                 try {
                     var pkt = codec.decode(actionBuf);
+                    FbrDeveloperMode.log("Game packet id {} decoded as {}", packetId, pkt.getClass().getSimpleName());
                     String dimStr = null;
                     if (pkt instanceof ClientboundLoginPacket   lp) dimStr = lp.commonPlayerSpawnInfo().dimension().toString();
                     else if (pkt instanceof ClientboundRespawnPacket rp) dimStr = rp.commonPlayerSpawnInfo().dimension().toString();
@@ -1199,8 +1232,11 @@ public class FbrWorldConverter {
                         currentDim[0] = slash >= 0
                                 ? dimStr.substring(slash + 2, dimStr.length() - 1).trim()
                                 : "minecraft:overworld";
+                        FbrDeveloperMode.log("Dimension is now {} (from {})", currentDim[0], pkt.getClass().getSimpleName());
                     }
-                } catch (Exception ignored) {}
+                } catch (Exception e) {
+                    FbrDeveloperMode.log("Game packet id {} could not be decoded while scanning: {}", packetId, e.toString());
+                }
 
             } else if (actionId == chunkCachedId) {
                 byte[] actionData = new byte[dataSize];
@@ -1208,6 +1244,8 @@ public class FbrWorldConverter {
                 FriendlyByteBuf indexBuf = new FriendlyByteBuf(io.netty.buffer.Unpooled.wrappedBuffer(actionData));
                 int chunkIndex = indexBuf.readVarInt();
                 int[] xz = indexToXZ.get(chunkIndex);
+                FbrDeveloperMode.log("Cached chunk reference index {} in {} -> {}", chunkIndex, currentDim[0],
+                        xz == null ? "no position known" : xz[0] + "," + xz[1]);
                 if (xz != null) {
                     dimPosToWinnerIndex
                             .computeIfAbsent(currentDim[0], k -> new LinkedHashMap<>())

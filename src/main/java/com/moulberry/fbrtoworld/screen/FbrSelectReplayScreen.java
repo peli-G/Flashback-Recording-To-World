@@ -101,6 +101,7 @@ public class FbrSelectReplayScreen extends Screen {
         this.searchBox.render(guiGraphics, mouseX, mouseY, partialTick);
         guiGraphics.drawCenteredString(this.font, this.title, this.width / 2, 8, 0xFFFFFFFF);
         FbrDiagnostics.drawLabel(guiGraphics, this.font, this.height);
+        com.moulberry.fbrtoworld.FbrDeveloperMode.drawLabel(guiGraphics, this.font, this.height);
 
         if (this.combineMode) {
             int combining = this.combineCount();
@@ -126,6 +127,11 @@ public class FbrSelectReplayScreen extends Screen {
         if (keyEvent.key() == GLFW.GLFW_KEY_D
                 && (mods & GLFW.GLFW_MOD_CONTROL) != 0 && (mods & GLFW.GLFW_MOD_SHIFT) != 0) {
             FbrDiagnostics.toggle();
+            return true;
+        }
+        if (keyEvent.key() == GLFW.GLFW_KEY_F
+                && (mods & GLFW.GLFW_MOD_CONTROL) != 0 && (mods & GLFW.GLFW_MOD_SHIFT) != 0) {
+            com.moulberry.fbrtoworld.FbrDeveloperMode.toggle();
             return true;
         }
         return super.keyPressed(keyEvent);

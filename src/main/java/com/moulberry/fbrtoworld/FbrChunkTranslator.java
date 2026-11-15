@@ -156,15 +156,22 @@ final class FbrChunkTranslator {
         }
 
         // The chunk's section data: try the current format first, then the older one with array lengths.
+        FbrDeveloperMode.log("Translating chunk {},{} in {}: {} raw bytes, {} sections from y={}",
+                cx, cz, dimension, raw.length, sectionCount, minSectionY);
         int[] blockCount = new int[1];
         List<Object> sections = parseSections(s, raw, sectionCount, minSectionY, false,
                 skyBySection, blockBySection, emptySky, emptyBlock, blockCount);
         if (sections == null) {
+            FbrDeveloperMode.log("Chunk {},{}: current section layout did not match, trying the older layout with array lengths", cx, cz);
             blockCount[0] = 0;
             sections = parseSections(s, raw, sectionCount, minSectionY, true,
                     skyBySection, blockBySection, emptySky, emptyBlock, blockCount);
         }
-        if (sections == null) throw new IllegalStateException("section data didn't match the expected layout");
+        if (sections == null) {
+            FbrDeveloperMode.log("Chunk {},{}: neither section layout matched", cx, cz);
+            throw new IllegalStateException("section data didn't match the expected layout");
+        }
+        FbrDeveloperMode.log("Chunk {},{}: parsed {} sections, {} non-air blocks", cx, cz, sections.size(), blockCount[0]);
 
         List<Object> blockEntities = new ArrayList<>();
         IOException[] beError = new IOException[1];
@@ -213,7 +220,9 @@ final class FbrChunkTranslator {
 
                 int nonAir = in.readShort();
                 if (nonAir > 0) blockCountOut[0] += nonAir;
-                if (ChunkWire.SECTION_HAS_FLUID_COUNT) in.readShort();
+                int fluids = -1;
+                if (ChunkWire.SECTION_HAS_FLUID_COUNT) fluids = in.readShort();
+                FbrDeveloperMode.log("Section y={}: nonAir={}, fluids={}, at byte {} of {}", sectionY, nonAir, fluids, in.pos, raw.length);
 
                 Map<String, Object> blocks = readContainer(s, in, 4096, true, lengthPrefixedArrays);
                 Map<String, Object> biomes = readContainer(s, in, 64, false, lengthPrefixedArrays);
@@ -245,6 +254,7 @@ final class FbrChunkTranslator {
     private static Map<String, Object> readContainer(Session s, Reader in, int entries, boolean blocks,
                                                      boolean lengthPrefixedArrays) throws Exception {
         int wireBits = in.readUnsignedByte();
+        FbrDeveloperMode.log("{} container: {} wire bits, lengthPrefixedArrays={}", blocks ? "Block" : "Biome", wireBits, lengthPrefixedArrays);
 
         // How Minecraft reads each bit size (same table as its Strategy configs).
         int storageBits;
@@ -265,7 +275,10 @@ final class FbrChunkTranslator {
             kind = 2;
             storageBits = wireBits;
         }
-        if (storageBits > 31) return null;
+        if (storageBits > 31) {
+            FbrDeveloperMode.log("Container rejected: storage bits {} too large", storageBits);
+            return null;
+        }
 
         int[] paletteIds;
         if (kind == 0) {
@@ -282,7 +295,10 @@ final class FbrChunkTranslator {
         int expectedLongs = storageBits == 0 ? 0 : (entries + (64 / storageBits) - 1) / (64 / storageBits);
         if (lengthPrefixedArrays) {
             int len = in.readVarInt();
-            if (len != expectedLongs) return null;
+            if (len != expectedLongs) {
+                FbrDeveloperMode.log("Container rejected: array length {} but expected {}", len, expectedLongs);
+                return null;
+            }
         }
         long[] data = new long[expectedLongs];
         for (int i = 0; i < expectedLongs; i++) data[i] = in.readLong();
