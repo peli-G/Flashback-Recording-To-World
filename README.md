@@ -23,10 +23,6 @@ Fabric API is required for this mod to work. You can download it [here](https://
 Requirements:
  - JDK 25
 
-# Building from source
-Requirements:
- - JDK 25
-
 ## Linux/macOS
  - Builds all versions of the mod: `./gradlew build`
  - Builds one version of the mod: `./gradlew :mc-<version>:build`
