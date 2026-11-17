@@ -1,6 +1,6 @@
 apply plugin: 'java'
 
-version = "${rootProject.property('mod_version')}+${project.property('minecraft_version')}"
+version = "${rootProject.property('mod_version')}+${project.hasProperty('mc_label') ? project.property('mc_label') : project.property('minecraft_version')}"
 group = rootProject.property('maven_group')
 
 base {
